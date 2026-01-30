@@ -1,10 +1,10 @@
+use futures::{join, Future, TryFutureExt};
+use safecast::AsType;
 use std::convert::TryInto;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{fmt, io};
-use futures::{join, Future, TryFutureExt};
-use safecast::AsType;
 use tokio::fs;
 use tokio::sync::{
     OwnedRwLockMappedWriteGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock,
@@ -679,10 +679,7 @@ async fn load<F: FileLoad, FE: From<F>>(path: &Path) -> Result<(usize, FE)> {
 
 // TODO: use borrowed rather than owned parameters
 // when https://github.com/rust-lang/rust/issues/100013 is resolved
-async fn persist<FE: FileSave>(
-    path: Arc<PathBuf>,
-    file: FE,
-) -> Result<u64> {
+async fn persist<FE: FileSave>(path: Arc<PathBuf>, file: FE) -> Result<u64> {
     let tmp = if let Some(ext) = path.extension().and_then(|ext| ext.to_str()) {
         path.with_extension(format!("{}_{}", ext, TMP))
     } else {
@@ -723,12 +720,19 @@ async fn persist<FE: FileSave>(
         assert!(!tmp.is_dir());
 
         file.save(&mut tmp_file)
-            .map_err(|cause| io::Error::new(cause.kind(), format!("failed to save tmp file: {}", cause)))
+            .map_err(|cause| {
+                io::Error::new(cause.kind(), format!("failed to save tmp file: {}", cause))
+            })
             .await?
     };
 
     tokio::fs::rename(tmp.as_path(), path.as_path())
-        .map_err(|cause| io::Error::new(cause.kind(), format!("failed to rename tmp file: {}", cause)))
+        .map_err(|cause| {
+            io::Error::new(
+                cause.kind(),
+                format!("failed to rename tmp file: {}", cause),
+            )
+        })
         .await?;
 
     Ok(size)

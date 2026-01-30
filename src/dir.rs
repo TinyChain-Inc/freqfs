@@ -824,7 +824,10 @@ mod tests {
         let uuid = Uuid::new_v4();
         let key = uuid.to_string();
 
-        assert_eq!(Name::partial_cmp(&uuid, key.as_str()), Some(Ordering::Equal));
+        assert_eq!(
+            Name::partial_cmp(&uuid, key.as_str()),
+            Some(Ordering::Equal)
+        );
         assert_eq!(Name::partial_cmp(&uuid, "not-a-uuid"), None);
     }
 }
