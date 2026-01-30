@@ -1,11 +1,11 @@
 [package]
 name = "freqfs"
-version = "0.11.0"
+version = "0.12.0"
 authors = ["code@tinychain.net"]
 edition = "2021"
 license = "Apache-2.0"
 description = "An in-memory filesystem cache layer over tokio::fs, with LFU eviction"
-repository = "https://github.com/haydnv/freqfs"
+repository = "https://github.com/TinyChain-Inc/freqfs.git"
 readme = "README.md"
 
 categories = ["caching", "filesystem", "memory-management"]
@@ -24,7 +24,7 @@ stream = ["bytes", "destream", "tbon", "tokio-util"]
 [dependencies]
 async-recursion = "1.1"
 bytes = { version = "1.7", optional = true }
-destream = { version = "0.9", optional = true }
+destream = { path = "../destream", version = "0.10.0", optional = true }
 ds-ext = "0.3"
 futures = "0.3"
 hr-id = { version = "0.6", optional = true }
