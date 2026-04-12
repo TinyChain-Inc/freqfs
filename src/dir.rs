@@ -90,31 +90,31 @@ impl<FE> DirDeref for DirWriteGuardOwned<FE> {
 /// A type that can be used to look up a directory entry without calling `to_string()`,
 /// to avoid unnecessary heap allocations.
 pub trait Name {
-    fn partial_cmp(&self, key: &String) -> Option<Ordering>;
+    fn partial_cmp(&self, key: &str) -> Option<Ordering>;
 }
 
 #[cfg(feature = "id")]
 impl Name for hr_id::Id {
-    fn partial_cmp(&self, key: &String) -> Option<Ordering> {
+    fn partial_cmp(&self, key: &str) -> Option<Ordering> {
         PartialOrd::partial_cmp(self, key)
     }
 }
 
 impl Name for String {
-    fn partial_cmp(&self, key: &String) -> Option<Ordering> {
-        PartialOrd::partial_cmp(self, key)
+    fn partial_cmp(&self, key: &str) -> Option<Ordering> {
+        PartialOrd::partial_cmp(self.as_str(), key)
     }
 }
 
 impl Name for str {
-    fn partial_cmp(&self, key: &String) -> Option<Ordering> {
-        PartialOrd::partial_cmp(self, key.as_str())
+    fn partial_cmp(&self, key: &str) -> Option<Ordering> {
+        PartialOrd::partial_cmp(self, key)
     }
 }
 
 impl Name for Arc<String> {
-    fn partial_cmp(&self, key: &String) -> Option<Ordering> {
-        PartialOrd::partial_cmp(&**self, key)
+    fn partial_cmp(&self, key: &str) -> Option<Ordering> {
+        PartialOrd::partial_cmp((**self).as_str(), key)
     }
 }
 
@@ -124,8 +124,8 @@ impl Name for Arc<String> {
 macro_rules! name_from_str {
     ($t:ty) => {
         impl $crate::Name for $t {
-            fn partial_cmp(&self, key: &String) -> Option<std::cmp::Ordering> {
-                let key = key.parse().ok()?;
+            fn partial_cmp(&self, key: &str) -> Option<std::cmp::Ordering> {
+                let key: $t = key.parse().ok()?;
                 std::cmp::PartialOrd::partial_cmp(self, &key)
             }
         }
@@ -182,18 +182,12 @@ impl<FE> DirEntry<FE> {
 
     /// Return `true` if this [`DirEntry`] is a [`Dir`].
     pub fn is_dir(&self) -> bool {
-        match self {
-            Self::Dir(_) => true,
-            _ => false,
-        }
+        matches!(self, Self::Dir(_))
     }
 
     /// Return `true` if this [`DirEntry`] is a file.
     pub fn is_file(&self) -> bool {
-        match self {
-            Self::Dir(_) => true,
-            _ => false,
-        }
+        matches!(self, Self::File(_))
     }
 }
 
@@ -324,7 +318,7 @@ impl<FE: Send + Sync> Dir<FE> {
 
     /// Convenience method to lock a file for reading.
     /// Returns a "not found" error if the there is no file with the given `name`.
-    pub async fn read_file<Q, F>(&self, name: &Q) -> Result<FileReadGuard<F>>
+    pub async fn read_file<Q, F>(&self, name: &Q) -> Result<FileReadGuard<'_, F>>
     where
         Q: Name + fmt::Display + ?Sized,
         F: FileLoad,
@@ -354,7 +348,7 @@ impl<FE: Send + Sync> Dir<FE> {
 
     /// Convenience method to lock a file for writing.
     /// Returns a "not found" error if the there is no file with the given `name`.
-    pub async fn write_file<Q, F>(&self, name: &Q) -> Result<FileWriteGuard<F>>
+    pub async fn write_file<Q, F>(&self, name: &Q) -> Result<FileWriteGuard<'_, F>>
     where
         Q: Name + fmt::Display + ?Sized,
         F: FileLoad,
@@ -645,14 +639,14 @@ impl<FE: Send + Sync> DirLock<FE> {
     }
 
     // This doesn't need to be async since it's only called at initialization time
-    pub(crate) fn load<'a>(cache: Arc<Cache<FE>>, path: PathBuf) -> Result<Self> {
+    pub(crate) fn load(cache: Arc<Cache<FE>>, path: PathBuf) -> Result<Self> {
         #[cfg(feature = "logging")]
         log::trace!("load cached dir at {}", path.display());
 
         let mut contents = OrdHashMap::new();
-        let mut handles = std::fs::read_dir(&path)?;
+        let handles = std::fs::read_dir(&path)?;
 
-        while let Some(handle) = handles.next() {
+        for handle in handles {
             let handle = handle?;
 
             let name = handle.file_name().into_string().map_err(|os_str| {
@@ -690,7 +684,7 @@ impl<FE: Send + Sync> DirLock<FE> {
     }
 
     /// Lock this directory for reading.
-    pub async fn read(&self) -> DirReadGuard<FE> {
+    pub async fn read(&self) -> DirReadGuard<'_, FE> {
         self.state.read().await
     }
 
@@ -700,7 +694,7 @@ impl<FE: Send + Sync> DirLock<FE> {
     }
 
     /// Lock this directory for reading synchronously, if possible.
-    pub fn try_read(&self) -> Result<DirReadGuard<FE>> {
+    pub fn try_read(&self) -> Result<DirReadGuard<'_, FE>> {
         self.state
             .try_read()
             .map_err(|cause| io::Error::new(io::ErrorKind::WouldBlock, cause))
@@ -720,7 +714,7 @@ impl<FE: Send + Sync> DirLock<FE> {
     }
 
     /// Lock this directory for writing.
-    pub async fn write(&self) -> DirWriteGuard<FE> {
+    pub async fn write(&self) -> DirWriteGuard<'_, FE> {
         self.state.write().await
     }
 
@@ -735,7 +729,7 @@ impl<FE: Send + Sync> DirLock<FE> {
     }
 
     /// Lock this directory for writing synchronously, if possible.
-    pub fn try_write(&self) -> Result<DirWriteGuard<FE>> {
+    pub fn try_write(&self) -> Result<DirWriteGuard<'_, FE>> {
         self.state
             .try_write()
             .map_err(|cause| io::Error::new(io::ErrorKind::WouldBlock, cause))
@@ -804,11 +798,11 @@ impl<FE> fmt::Debug for DirLock<FE> {
 }
 
 async fn delete_dir(path: &Path) -> Result<()> {
-    return match fs::remove_dir_all(path).await {
+    match fs::remove_dir_all(path).await {
         Ok(()) => Ok(()),
         Err(cause) if cause.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(cause) => Err(cause),
-    };
+    }
 }
 
 #[inline]
@@ -816,5 +810,24 @@ fn partial_cmp<'a, Q>(name: &'a Q) -> impl Fn(&String) -> Option<Ordering> + Cop
 where
     Q: Name + ?Sized,
 {
-    |key| Name::partial_cmp(name, key)
+    |key| Name::partial_cmp(name, key.as_str())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Name;
+    use std::cmp::Ordering;
+    use uuid::Uuid;
+
+    #[test]
+    fn name_partial_cmp_uuid() {
+        let uuid = Uuid::new_v4();
+        let key = uuid.to_string();
+
+        assert_eq!(
+            Name::partial_cmp(&uuid, key.as_str()),
+            Some(Ordering::Equal)
+        );
+        assert_eq!(Name::partial_cmp(&uuid, "not-a-uuid"), None);
+    }
 }

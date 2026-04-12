@@ -10,7 +10,12 @@ You can find instructions for creating a pull request in
 
 ## Licensing
 
-By contributing code to this project, you represent that you own the copyright on your contributions, or that you have followed the licensing requirements of the copyright holder, and that your code may be used without any further restrictions than those specified in the Apache 2.0 open-source license. A copy of the license can be found in the `LICENSE` file in the root directory of the project.
+By contributing code to this project, you represent that you authored the work
+(or otherwise have the rights to contribute it), that it is unencumbered by
+third-party intellectual property claims, and that you transfer and assign all
+right, title, and interest in the contribution to The TinyChain Contributors for
+distribution under the Apache 2.0 license. A copy of the license can be found in
+the `LICENSE` file in the root directory of the project.
 
 ## Code of Conduct
 

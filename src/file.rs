@@ -1,10 +1,10 @@
+use futures::{join, Future, TryFutureExt};
+use safecast::AsType;
 use std::convert::TryInto;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{fmt, io};
-use futures::{join, Future, TryFutureExt};
-use safecast::AsType;
 use tokio::fs;
 use tokio::sync::{
     OwnedRwLockMappedWriteGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock,
@@ -14,7 +14,7 @@ use tokio::sync::{
 use super::cache::Cache;
 use super::Result;
 
-const TMP: &'static str = "_freqfs";
+const TMP: &str = "_freqfs";
 
 /// A read guard on a file
 pub type FileReadGuard<'a, F> = RwLockReadGuard<'a, F>;
@@ -142,24 +142,15 @@ enum FileLockState {
 
 impl FileLockState {
     fn is_deleted(&self) -> bool {
-        match self {
-            Self::Deleted(_) => true,
-            _ => false,
-        }
+        matches!(self, Self::Deleted(_))
     }
 
     fn is_loaded(&self) -> bool {
-        match self {
-            Self::Read(_) | Self::Modified(_) => true,
-            _ => false,
-        }
+        matches!(self, Self::Read(_) | Self::Modified(_))
     }
 
     fn is_pending(&self) -> bool {
-        match self {
-            Self::Pending => true,
-            _ => false,
-        }
+        matches!(self, Self::Pending)
     }
 
     fn upgrade(&mut self) {
@@ -275,7 +266,7 @@ impl<FE> FileLock<FE> {
         if this.is_loaded() {
             let (mut this_data, that_data) = join!(self.contents.write(), other.contents.read());
             let that_data = that_data.as_ref().expect("file");
-            *this_data = Some(FE::clone(&*that_data));
+            *this_data = Some(FE::clone(that_data));
         }
 
         self.cache.resize(old_size, new_size);
@@ -284,7 +275,7 @@ impl<FE> FileLock<FE> {
     }
 
     /// Lock this file for reading.
-    pub async fn read<F>(&self) -> Result<FileReadGuard<F>>
+    pub async fn read<F>(&self) -> Result<FileReadGuard<'_, F>>
     where
         F: FileLoad,
         FE: AsType<F>,
@@ -297,7 +288,7 @@ impl<FE> FileLock<FE> {
 
         let guard = if state.is_pending() {
             let mut contents = self.contents.try_write().expect("file contents");
-            let (size, entry) = load(&**self.path).await?;
+            let (size, entry) = load(&self.path).await?;
 
             self.cache.bump(&self.path, Some(size));
 
@@ -314,7 +305,7 @@ impl<FE> FileLock<FE> {
     }
 
     /// Lock this file for reading synchronously if possible, otherwise return an error.
-    pub fn try_read<F>(&self) -> Result<FileReadGuard<F>>
+    pub fn try_read<F>(&self) -> Result<FileReadGuard<'_, F>>
     where
         F: FileLoad,
         FE: AsType<F>,
@@ -351,7 +342,7 @@ impl<FE> FileLock<FE> {
                 .try_write_owned()
                 .expect("file contents");
 
-            let (size, entry) = load(&**self.path).await?;
+            let (size, entry) = load(&self.path).await?;
 
             self.cache.bump(&self.path, Some(size));
 
@@ -405,7 +396,7 @@ impl<FE> FileLock<FE> {
 
         let guard = if state.is_pending() {
             let mut contents = self.contents.try_write_owned().expect("file contents");
-            let (size, entry) = load(&**self.path).await?;
+            let (size, entry) = load(&self.path).await?;
 
             self.cache.bump(&self.path, Some(size));
 
@@ -422,7 +413,7 @@ impl<FE> FileLock<FE> {
     }
 
     /// Lock this file for writing.
-    pub async fn write<F>(&self) -> Result<FileWriteGuard<F>>
+    pub async fn write<F>(&self) -> Result<FileWriteGuard<'_, F>>
     where
         F: FileLoad,
         FE: AsType<F>,
@@ -435,7 +426,7 @@ impl<FE> FileLock<FE> {
 
         let guard = if state.is_pending() {
             let mut contents = self.contents.try_write().expect("file contents");
-            let (size, entry) = load(&**self.path).await?;
+            let (size, entry) = load(&self.path).await?;
 
             self.cache.bump(&self.path, Some(size));
 
@@ -455,7 +446,7 @@ impl<FE> FileLock<FE> {
     }
 
     /// Lock this file for writing synchronously if possible, otherwise return an error.
-    pub fn try_write<F>(&self) -> Result<FileWriteGuard<F>>
+    pub fn try_write<F>(&self) -> Result<FileWriteGuard<'_, F>>
     where
         F: FileLoad,
         FE: AsType<F>,
@@ -493,7 +484,7 @@ impl<FE> FileLock<FE> {
                 .try_write_owned()
                 .expect("file contents");
 
-            let (size, entry) = load(&**self.path).await?;
+            let (size, entry) = load(&self.path).await?;
             self.cache.bump(&self.path, Some(size));
 
             *state = FileLockState::Modified(size);
@@ -575,10 +566,8 @@ impl<FE> FileLock<FE> {
                 FileLockState::Read(new_size as usize)
             }
             FileLockState::Deleted(needs_sync) => {
-                if *needs_sync {
-                    if self.path.exists() {
-                        delete_file(&self.path).await?;
-                    }
+                if *needs_sync && self.path.exists() {
+                    delete_file(&self.path).await?;
                 }
 
                 FileLockState::Deleted(false)
@@ -690,71 +679,63 @@ async fn load<F: FileLoad, FE: From<F>>(path: &Path) -> Result<(usize, FE)> {
 
 // TODO: use borrowed rather than owned parameters
 // when https://github.com/rust-lang/rust/issues/100013 is resolved
-fn persist<'a, FE: FileSave>(
-    path: Arc<PathBuf>,
-    file: FE,
-) -> impl Future<Output = Result<u64>> + Send {
-    async move {
-        let tmp = if let Some(ext) = path.extension().and_then(|ext| ext.to_str()) {
-            path.with_extension(format!("{}_{}", ext, TMP))
+async fn persist<FE: FileSave>(path: Arc<PathBuf>, file: FE) -> Result<u64> {
+    let tmp = if let Some(ext) = path.extension().and_then(|ext| ext.to_str()) {
+        path.with_extension(format!("{}_{}", ext, TMP))
+    } else {
+        path.with_extension(TMP)
+    };
+
+    let size = {
+        let mut tmp_file = if tmp.exists() {
+            fs::OpenOptions::new()
+                .truncate(true)
+                .write(true)
+                .open(tmp.as_path())
+                .await?
         } else {
-            path.with_extension(TMP)
-        };
+            let parent = tmp.parent().expect("dir");
+            let mut i = 0;
+            while !parent.exists() {
+                create_dir(parent).await?;
+                tokio::time::sleep(tokio::time::Duration::from_millis(i)).await;
+                i += 1;
+            }
 
-        let size = {
-            let mut tmp_file = if tmp.exists() {
-                fs::OpenOptions::new()
-                    .truncate(true)
-                    .write(true)
-                    .open(tmp.as_path())
-                    .await?
-            } else {
-                let parent = tmp.parent().expect("dir");
-                let mut i = 0;
-                while !parent.exists() {
-                    create_dir(parent).await?;
-                    tokio::time::sleep(tokio::time::Duration::from_millis(i)).await;
-                    i += 1;
-                }
+            assert!(parent.exists());
 
-                assert!(parent.exists());
-
-                let tmp_file = fs::File::create(tmp.as_path())
-                    .map_err(|cause| {
-                        io::Error::new(
-                            cause.kind(),
-                            format!("failed to create tmp file: {}", cause),
-                        )
-                    })
-                    .await?;
-
-                tmp_file
-            };
-
-            assert!(tmp.exists());
-            assert!(!tmp.is_dir());
-
-            let size = file
-                .save(&mut tmp_file)
+            let tmp_file = fs::File::create(tmp.as_path())
                 .map_err(|cause| {
-                    io::Error::new(cause.kind(), format!("failed to save tmp file: {}", cause))
+                    io::Error::new(
+                        cause.kind(),
+                        format!("failed to create tmp file: {}", cause),
+                    )
                 })
                 .await?;
 
-            size
+            tmp_file
         };
 
-        tokio::fs::rename(tmp.as_path(), path.as_path())
-            .map_err(|cause| {
-                io::Error::new(
-                    cause.kind(),
-                    format!("failed to rename tmp file: {}", cause),
-                )
-            })
-            .await?;
+        assert!(tmp.exists());
+        assert!(!tmp.is_dir());
 
-        Ok(size)
-    }
+        file.save(&mut tmp_file)
+            .map_err(|cause| {
+                io::Error::new(cause.kind(), format!("failed to save tmp file: {}", cause))
+            })
+            .await?
+    };
+
+    tokio::fs::rename(tmp.as_path(), path.as_path())
+        .map_err(|cause| {
+            io::Error::new(
+                cause.kind(),
+                format!("failed to rename tmp file: {}", cause),
+            )
+        })
+        .await?;
+
+    Ok(size)
 }
 
 async fn create_dir(path: &Path) -> Result<()> {
@@ -767,10 +748,10 @@ async fn create_dir(path: &Path) -> Result<()> {
                 if path.exists() && path.is_dir() {
                     Ok(())
                 } else {
-                    return Err(io::Error::new(
+                    Err(io::Error::new(
                         cause.kind(),
                         format!("failed to create directory: {}", cause),
-                    ));
+                    ))
                 }
             }
         }
@@ -871,4 +852,56 @@ where
     E: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     io::Error::new(io::ErrorKind::WouldBlock, cause)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{persist, FileSave};
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use tokio::fs;
+    use tokio::io::AsyncWriteExt;
+
+    fn unique_tmp_dir() -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("freqfs_test_file_{}", uuid::Uuid::new_v4()));
+        path
+    }
+
+    struct PartialThenFail {
+        bytes: Vec<u8>,
+        kind: std::io::ErrorKind,
+    }
+
+    impl FileSave for PartialThenFail {
+        async fn save(&self, file: &mut fs::File) -> crate::Result<u64> {
+            file.write_all(&self.bytes).await?;
+            Err(std::io::Error::new(self.kind, "intentional failure"))
+        }
+    }
+
+    #[tokio::test]
+    async fn persist_does_not_corrupt_existing_file_on_save_error() -> std::io::Result<()> {
+        let tmp = unique_tmp_dir();
+        fs::create_dir(&tmp).await?;
+
+        let path = tmp.join("data.txt");
+        fs::write(&path, b"original").await?;
+
+        let err = persist(
+            Arc::new(path.clone()),
+            PartialThenFail {
+                bytes: b"new".to_vec(),
+                kind: std::io::ErrorKind::Other,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert_eq!(fs::read(&path).await?, b"original");
+
+        let _ = fs::remove_dir_all(&tmp).await;
+        Ok(())
+    }
 }

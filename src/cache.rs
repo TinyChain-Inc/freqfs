@@ -14,18 +14,20 @@ use super::Result;
 const GC_CYCLE_TIME: Duration = Duration::from_millis(10);
 const MAX_FILE_HANDLES: usize = 512;
 
-type LFU<FE> = ds_ext::LinkedHashMap<PathBuf, FileLock<FE>>;
+type Lfu<FE> = ds_ext::LinkedHashMap<PathBuf, FileLock<FE>>;
 
 struct State<FE> {
-    files: LFU<FE>,
+    files: Lfu<FE>,
     size: usize,
+    roots: Vec<PathBuf>,
 }
 
 impl<FE> State<FE> {
     fn new() -> Self {
         Self {
             size: 0,
-            files: LFU::new(),
+            files: Lfu::new(),
+            roots: Vec::new(),
         }
     }
 }
@@ -50,7 +52,7 @@ impl<FE> Cache<FE> {
     }
 
     #[inline]
-    fn lock(&self) -> MutexGuard<State<FE>> {
+    fn lock(&self) -> MutexGuard<'_, State<FE>> {
         self.state.lock().expect("file cache state")
     }
 
@@ -136,8 +138,9 @@ where
     pub fn load(self: Arc<Self>, path: PathBuf) -> Result<DirLock<FE>> {
         {
             let state = self.lock();
-            for (file_path, _) in state.files.iter() {
-                if file_path.starts_with(&path) || path.starts_with(file_path) {
+
+            for root in &state.roots {
+                if root.starts_with(&path) || path.starts_with(root) {
                     return Err(io::Error::new(
                         io::ErrorKind::AlreadyExists,
                         format!(
@@ -149,7 +152,12 @@ where
             }
         }
 
-        DirLock::load(self, path)
+        let dir = DirLock::load(self.clone(), path.clone())?;
+
+        let mut state = self.lock();
+        state.roots.push(path);
+
+        Ok(dir)
     }
 
     fn gc(&self) -> FuturesUnordered<impl Future<Output = Result<()>> + Send> {
@@ -200,4 +208,98 @@ where
             tokio::time::sleep(GC_CYCLE_TIME).await;
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cache, State, MAX_FILE_HANDLES};
+    use crate::file::FileSave;
+    use crate::FileLock;
+    use futures::StreamExt;
+    use safecast::as_type;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::AsyncWriteExt;
+    use tokio::sync::mpsc;
+
+    #[derive(Clone)]
+    enum Entry {
+        Bin(Vec<u8>),
+    }
+
+    impl FileSave for Entry {
+        async fn save(&self, file: &mut tokio::fs::File) -> crate::Result<u64> {
+            match self {
+                Self::Bin(bytes) => {
+                    file.write_all(bytes).await?;
+                    Ok(bytes.len() as u64)
+                }
+            }
+        }
+    }
+
+    as_type!(Entry, Bin, Vec<u8>);
+
+    #[cfg(not(feature = "stream"))]
+    impl crate::file::FileLoad for Vec<u8> {
+        async fn load(
+            _path: &std::path::Path,
+            mut file: tokio::fs::File,
+            _metadata: std::fs::Metadata,
+        ) -> crate::Result<Self> {
+            use tokio::io::AsyncReadExt;
+
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).await?;
+            Ok(bytes)
+        }
+    }
+
+    fn unique_tmp_dir() -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("freqfs_test_cache_{}", uuid::Uuid::new_v4()));
+        path
+    }
+
+    #[tokio::test]
+    async fn lfu_eviction_prefers_least_used() -> std::io::Result<()> {
+        let tmp = unique_tmp_dir();
+        tokio::fs::create_dir(&tmp).await?;
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let cache = Arc::new(Cache {
+            capacity: 10,
+            max_file_handles: MAX_FILE_HANDLES,
+            state: Mutex::new(State::new()),
+            tx,
+        });
+
+        let path_a = tmp.join("a.bin");
+        let path_b = tmp.join("b.bin");
+
+        let file_a: FileLock<Entry> =
+            FileLock::new(cache.clone(), path_a.clone(), vec![1u8; 10], 10);
+        let file_b: FileLock<Entry> =
+            FileLock::new(cache.clone(), path_b.clone(), vec![2u8; 10], 10);
+
+        cache.insert(path_a.clone(), file_a.clone(), 10);
+        cache.insert(path_b.clone(), file_b.clone(), 10);
+
+        // make `a.bin` the most frequently used
+        cache.bump(&path_a, None);
+
+        let mut evictions = cache.gc();
+        while let Some(result) = evictions.next().await {
+            result?;
+        }
+
+        assert!(file_a.try_read::<Vec<u8>>().is_ok());
+
+        let evicted = file_b.try_read::<Vec<u8>>().unwrap_err();
+        assert_eq!(evicted.kind(), std::io::ErrorKind::WouldBlock);
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+        Ok(())
+    }
 }
