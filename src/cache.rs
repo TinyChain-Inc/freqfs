@@ -1,5 +1,6 @@
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use futures::future::Future;
@@ -7,12 +8,32 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::time::Duration;
 
+use super::backpressure::{BackpressureConfig, BackpressureManager};
 use super::dir::DirLock;
 use super::file::{FileLock, FileSave};
 use super::Result;
 
 const GC_CYCLE_TIME: Duration = Duration::from_millis(10);
 const MAX_FILE_HANDLES: usize = 512;
+
+fn cache_backpressure() -> &'static BackpressureManager {
+    static CACHE_BACKPRESSURE: std::sync::OnceLock<BackpressureManager> =
+        std::sync::OnceLock::new();
+    CACHE_BACKPRESSURE.get_or_init(|| {
+        let config = BackpressureConfig {
+            max_inflight: 1,
+            ..BackpressureConfig::default()
+        };
+
+        BackpressureManager::new(config)
+    })
+}
+
+fn next_cache_backpressure_key() -> String {
+    static NEXT_CACHE_ID: AtomicU64 = AtomicU64::new(0);
+    let id = NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed);
+    format!("freqfs.cache.gc.{id}")
+}
 
 type Lfu<FE> = ds_ext::LinkedHashMap<PathBuf, FileLock<FE>>;
 
@@ -37,6 +58,7 @@ struct Evict;
 
 /// An in-memory cache layer over [`tokio::fs`] with least-frequently-used (LFU) eviction.
 pub struct Cache<FE> {
+    backpressure_key: String,
     capacity: usize,
     max_file_handles: usize,
     state: Mutex<State<FE>>,
@@ -47,7 +69,14 @@ impl<FE> Cache<FE> {
     #[inline]
     fn check(&self, state: MutexGuard<State<FE>>) {
         if state.size > self.capacity {
-            self.tx.send(Evict).expect("cache cleanup thread");
+            if cache_backpressure().try_acquire(&self.backpressure_key) {
+                if self.tx.send(Evict).is_err() {
+                    cache_backpressure().release(&self.backpressure_key);
+                    panic!("cache cleanup thread");
+                }
+            } else {
+                cache_backpressure().report_pressure(&self.backpressure_key);
+            }
         }
     }
 
@@ -120,6 +149,7 @@ where
         let (tx, rx) = mpsc::unbounded_channel();
 
         let cache = Arc::new(Self {
+            backpressure_key: next_cache_backpressure_key(),
             capacity,
             max_file_handles,
             state: Mutex::new(State::new()),
@@ -200,9 +230,16 @@ where
             while let Some(result) = evictions.next().await {
                 match result {
                     Ok(()) => {}
-                    Err(cause) => panic!("failed to evict file from cache: {}", cause),
+                    Err(cause) => {
+                        cache_backpressure().report_pressure(&cache.backpressure_key);
+                        cache_backpressure().release(&cache.backpressure_key);
+                        panic!("failed to evict file from cache: {}", cause);
+                    }
                 }
             }
+
+            cache_backpressure().report_success(&cache.backpressure_key);
+            cache_backpressure().release(&cache.backpressure_key);
 
             // let the filesystem catch up in case there's another gc cycle immediately after this
             tokio::time::sleep(GC_CYCLE_TIME).await;
@@ -212,7 +249,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{Cache, State, MAX_FILE_HANDLES};
+    use super::{cache_backpressure, next_cache_backpressure_key, Cache, State, MAX_FILE_HANDLES};
     use crate::file::FileSave;
     use crate::FileLock;
     use futures::StreamExt;
@@ -269,6 +306,7 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
 
         let cache = Arc::new(Cache {
+            backpressure_key: next_cache_backpressure_key(),
             capacity: 10,
             max_file_handles: MAX_FILE_HANDLES,
             state: Mutex::new(State::new()),
@@ -301,5 +339,43 @@ mod tests {
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;
         Ok(())
+    }
+
+    #[test]
+    fn tiny_capacity_backpressure_throttles_duplicate_evict_signals() {
+        let tmp = unique_tmp_dir();
+        std::fs::create_dir_all(&tmp).expect("create test dir");
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let cache = Arc::new(Cache {
+            backpressure_key: next_cache_backpressure_key(),
+            capacity: 1,
+            max_file_handles: MAX_FILE_HANDLES,
+            state: Mutex::new(State::new()),
+            tx,
+        });
+
+        let path_a = tmp.join("a.bin");
+        let path_b = tmp.join("b.bin");
+        let path_c = tmp.join("c.bin");
+
+        let file_a: FileLock<Entry> = FileLock::new(cache.clone(), path_a.clone(), vec![1u8; 2], 2);
+        let file_b: FileLock<Entry> = FileLock::new(cache.clone(), path_b.clone(), vec![2u8; 2], 2);
+        let file_c: FileLock<Entry> = FileLock::new(cache.clone(), path_c.clone(), vec![3u8; 2], 2);
+
+        cache.insert(path_a, file_a, 2);
+        assert!(rx.try_recv().is_ok());
+
+        cache.insert(path_b, file_b, 2);
+        assert!(rx.try_recv().is_err());
+
+        cache_backpressure().report_success(&cache.backpressure_key);
+        cache_backpressure().release(&cache.backpressure_key);
+
+        cache.insert(path_c, file_c, 2);
+        assert!(rx.try_recv().is_ok());
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
