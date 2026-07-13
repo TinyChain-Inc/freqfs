@@ -25,7 +25,7 @@ stream = ["bytes", "destream", "tbon", "tokio-util"]
 async-recursion = "1.1"
 bytes = { version = "1.7", optional = true }
 destream = { path = "../destream", version = "0.10.0", optional = true }
-ds-ext = "0.3"
+ds-ext = { path = "../ds-ext", version = "0.4" }
 futures = "0.3"
 hr-id = { path = "../hr-id", version = "0.7.0", optional = true }
 log = { version = "0.4", optional = true }
