@@ -623,8 +623,9 @@ impl<FE> FileLock<FE> {
                 persist(self.path.clone(), contents).await?;
             }
 
-            self.cache.resize(old_size, 0);
-
+            // Cache size is adjusted by gc() while it holds Cache::state,
+            // so the eviction future only needs to transition the file state
+            // back to Pending. This avoids a File -> Cache lock ordering inversion.
             *state = FileLockState::Pending;
             Ok(())
         };
@@ -695,25 +696,31 @@ async fn persist<FE: FileSave>(path: Arc<PathBuf>, file: FE) -> Result<u64> {
                 .await?
         } else {
             let parent = tmp.parent().expect("dir");
-            let mut i = 0;
-            while !parent.exists() {
-                create_dir(parent).await?;
-                tokio::time::sleep(tokio::time::Duration::from_millis(i)).await;
-                i += 1;
-            }
+            create_dir(parent).await?;
 
-            assert!(parent.exists());
-
-            let tmp_file = fs::File::create(tmp.as_path())
-                .map_err(|cause| {
-                    io::Error::new(
+            match fs::File::create(tmp.as_path()).await {
+                Ok(file) => file,
+                Err(cause) if cause.kind() == io::ErrorKind::NotFound => {
+                    // The parent directory may have been removed between
+                    // create_dir and File::create (TOCTOU race).
+                    // Retry directory creation then create the file.
+                    create_dir(parent).await?;
+                    fs::File::create(tmp.as_path())
+                        .map_err(|cause| {
+                            io::Error::new(
+                                cause.kind(),
+                                format!("failed to create tmp file: {}", cause),
+                            )
+                        })
+                        .await?
+                }
+                Err(cause) => {
+                    return Err(io::Error::new(
                         cause.kind(),
                         format!("failed to create tmp file: {}", cause),
-                    )
-                })
-                .await?;
-
-            tmp_file
+                    ))
+                }
+            }
         };
 
         assert!(tmp.exists());

@@ -5,13 +5,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use futures::future::Future;
 use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
-use tokio::time::Duration;
 
 use super::dir::DirLock;
 use super::file::{FileLock, FileSave};
 use super::Result;
 
-const GC_CYCLE_TIME: Duration = Duration::from_millis(10);
 const MAX_FILE_HANDLES: usize = 512;
 
 type Lfu<FE> = ds_ext::LinkedHashMap<PathBuf, FileLock<FE>>;
@@ -163,16 +161,18 @@ where
     fn gc(&self) -> FuturesUnordered<impl Future<Output = Result<()>> + Send> {
         let evictions = FuturesUnordered::new();
 
-        let state = self.lock();
+        let mut state = self.lock();
 
         if state.size < self.capacity {
             return evictions;
         }
 
         let mut over = state.size as i64 - self.capacity as i64;
+        let mut total_evicted = 0usize;
 
         for (_path, file) in state.files.iter().rev() {
             if let Some((size, eviction)) = file.clone().evict() {
+                total_evicted += size;
                 over -= size as i64;
                 evictions.push(eviction);
             }
@@ -182,6 +182,16 @@ where
             }
         }
 
+        // Update the cache size now, while we still hold Cache::state.
+        // This ensures the lock acquisition order is strictly Cache -> File
+        // (LIFO: acquire Cache first, then File inside evict(), then release File,
+        // then release Cache) and avoids a File -> Cache inversion in the
+        // eviction future that runs *after* Cache::state is released.
+        state.size -= total_evicted;
+
+        // state (Cache::state guard) is dropped here, before eviction futures run.
+        // Since size was already adjusted above, the eviction futures do not need
+        // to call cache.resize() and therefore never acquire Cache::state.
         evictions
     }
 }
@@ -195,17 +205,27 @@ where
 {
     tokio::spawn(async move {
         while let Some(Evict) = rx.recv().await {
-            let mut evictions = cache.gc();
+            // Coalesce: drain any Evict signals that accumulated while we were
+            // processing the previous cycle, so we don't run redundant GC passes.
+            while rx.try_recv().is_ok() {}
 
-            while let Some(result) = evictions.next().await {
-                match result {
-                    Ok(()) => {}
-                    Err(cause) => panic!("failed to evict file from cache: {}", cause),
+            loop {
+                let mut evictions = cache.gc();
+
+                if evictions.is_empty() {
+                    // Cache is within capacity, or no evictable files remain
+                    // (all candidates are currently locked). In either case
+                    // there's nothing more to do until a new Evict signal arrives.
+                    break;
+                }
+
+                while let Some(result) = evictions.next().await {
+                    match result {
+                        Ok(()) => {}
+                        Err(cause) => panic!("failed to evict file from cache: {}", cause),
+                    }
                 }
             }
-
-            // let the filesystem catch up in case there's another gc cycle immediately after this
-            tokio::time::sleep(GC_CYCLE_TIME).await;
         }
     })
 }
