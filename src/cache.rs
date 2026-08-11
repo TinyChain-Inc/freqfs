@@ -14,7 +14,6 @@ use super::dir::DirLock;
 use super::file::{FileLock, FileSave};
 use super::Result;
 
-const GC_CYCLE_TIME: Duration = Duration::from_millis(10);
 const MAX_FILE_HANDLES: usize = 512;
 
 type Lfu<FE> = ds_ext::LinkedHashMap<PathBuf, FileLock<FE>>;
@@ -376,9 +375,6 @@ where
             if evicted {
                 cache.check(cache.lock());
             }
-
-            // let the filesystem catch up in case there's another gc cycle immediately after this
-            tokio::time::sleep(GC_CYCLE_TIME).await;
         }
     })
 }
