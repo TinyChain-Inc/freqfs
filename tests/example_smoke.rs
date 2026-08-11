@@ -85,8 +85,9 @@ async fn run_example(cache: DirLock<File>) -> Result<(), io::Error> {
         let sub_sub_dir = sub_dir.create_dir("sub-subdir".to_string())?;
         let mut sub_sub_dir = sub_sub_dir.write().await;
 
-        let binary_file =
-            sub_sub_dir.create_file("vector.bin".to_string(), (0..25).collect::<Vec<u8>>(), 25)?;
+        let binary_file = sub_sub_dir
+            .create_file("vector.bin".to_string(), (0..25).collect::<Vec<u8>>(), 25)
+            .await?;
 
         let binary_file: FileReadGuard<Vec<u8>> = binary_file.read().await?;
 
@@ -116,7 +117,7 @@ async fn run_example(cache: DirLock<File>) -> Result<(), io::Error> {
 async fn example_smoke() -> Result<(), io::Error> {
     let path = setup_tmp_dir().await?;
 
-    let cache = Cache::new(40, None);
+    let cache = Cache::new(128, None, 0, Duration::from_secs(3));
     let root = cache.load(path.clone())?;
 
     run_example(root).await?;

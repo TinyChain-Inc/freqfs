@@ -47,7 +47,7 @@ async fn setup_tmp_dir() -> Result<PathBuf, io::Error> {
 async fn concurrent_read_write_does_not_deadlock() -> Result<(), io::Error> {
     let path = setup_tmp_dir().await?;
 
-    let cache = Cache::<File>::new(1024 * 1024, None);
+    let cache = Cache::<File>::new(1024 * 1024, None, 0, std::time::Duration::from_secs(3));
     let root = cache.load(path.clone())?;
 
     let file = {

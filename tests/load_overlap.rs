@@ -28,7 +28,7 @@ async fn cache_load_rejects_overlapping_roots() -> Result<(), io::Error> {
     fs::create_dir(&root).await?;
     fs::create_dir(root.join("sub")).await?;
 
-    let cache = Cache::<Entry>::new(1024 * 1024, None);
+    let cache = Cache::<Entry>::new(1024 * 1024, None, 0, std::time::Duration::from_secs(3));
 
     let _dir = cache.clone().load(root.clone())?;
 

@@ -38,16 +38,19 @@ async fn setup_tmp_dir() -> Result<PathBuf, io::Error> {
 async fn delete_then_recreate_file_and_dir() -> Result<(), io::Error> {
     let path = setup_tmp_dir().await?;
 
-    let cache = Cache::<File>::new(1024 * 1024, None);
+    let cache = Cache::<File>::new(1024 * 1024, None, 0, std::time::Duration::from_secs(3));
     let root = cache.load(path.clone())?;
 
     {
         let mut dir = root.write().await;
 
         // keep at least one entry so syncing deletions won't delete the root dir
-        dir.create_file("keep.txt".to_string(), "keep".to_string(), 4)?;
+        dir.create_file("keep.txt".to_string(), "keep".to_string(), 4)
+            .await?;
 
-        let file = dir.create_file("a.txt".to_string(), "first".to_string(), 5)?;
+        let file = dir
+            .create_file("a.txt".to_string(), "first".to_string(), 5)
+            .await?;
         file.sync().await?;
     }
 
@@ -64,7 +67,9 @@ async fn delete_then_recreate_file_and_dir() -> Result<(), io::Error> {
 
     {
         let mut dir = root.write().await;
-        let file = dir.create_file("a.txt".to_string(), "second".to_string(), 6)?;
+        let file = dir
+            .create_file("a.txt".to_string(), "second".to_string(), 6)
+            .await?;
         file.sync().await?;
     }
 
@@ -83,7 +88,9 @@ async fn delete_then_recreate_file_and_dir() -> Result<(), io::Error> {
 
         {
             let mut subdir = subdir.write().await;
-            let file = subdir.create_file("x.txt".to_string(), "x".to_string(), 1)?;
+            let file = subdir
+                .create_file("x.txt".to_string(), "x".to_string(), 1)
+                .await?;
             file.sync().await?;
         }
     }
@@ -104,7 +111,9 @@ async fn delete_then_recreate_file_and_dir() -> Result<(), io::Error> {
         let subdir = dir.create_dir("d".to_string())?;
 
         let mut subdir = subdir.write().await;
-        let file = subdir.create_file("y.txt".to_string(), "y".to_string(), 1)?;
+        let file = subdir
+            .create_file("y.txt".to_string(), "y".to_string(), 1)
+            .await?;
         file.sync().await?;
     }
 

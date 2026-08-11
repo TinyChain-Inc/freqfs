@@ -21,14 +21,12 @@
 //! be sure to check the permissions before modifying it.
 //! The background cleanup thread will panic if it attempts an impermissible write operation.
 
-mod backpressure;
 mod cache;
 mod dir;
 mod file;
 
 type Result<T> = std::result::Result<T, std::io::Error>;
 
-pub use backpressure::{Admission, BackpressureConfig, BackpressureManager, PressureSignal};
 pub use cache::Cache;
 pub use dir::{
     Dir, DirDeref, DirEntry, DirLock, DirReadGuard, DirReadGuardOwned, DirWriteGuard,

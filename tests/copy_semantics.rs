@@ -39,7 +39,7 @@ async fn setup_tmp_dir() -> Result<PathBuf, io::Error> {
 async fn copy_dir_from_preserves_tree_and_contents() -> Result<(), io::Error> {
     let path = setup_tmp_dir().await?;
 
-    let cache = Cache::<File>::new(1024 * 1024, None);
+    let cache = Cache::<File>::new(1024 * 1024, None, 0, std::time::Duration::from_secs(3));
     let root = cache.load(path.clone())?;
 
     let src = {
@@ -49,12 +49,18 @@ async fn copy_dir_from_preserves_tree_and_contents() -> Result<(), io::Error> {
 
     {
         let mut src_dir = src.write().await;
-        src_dir.create_file("a.txt".to_string(), "hello".to_string(), 5)?;
-        src_dir.create_file("b.bin".to_string(), vec![1u8, 2, 3], 3)?;
+        src_dir
+            .create_file("a.txt".to_string(), "hello".to_string(), 5)
+            .await?;
+        src_dir
+            .create_file("b.bin".to_string(), vec![1u8, 2, 3], 3)
+            .await?;
 
         let nested = src_dir.create_dir("nested".to_string())?;
         let mut nested = nested.write().await;
-        nested.create_file("c.txt".to_string(), "world".to_string(), 5)?;
+        nested
+            .create_file("c.txt".to_string(), "world".to_string(), 5)
+            .await?;
     }
 
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -95,7 +101,9 @@ async fn copy_dir_from_preserves_tree_and_contents() -> Result<(), io::Error> {
         std::mem::drop(src_dir);
 
         let mut dst_dir = dst.write().await;
-        dst_dir.create_file("a.txt".to_string(), "old".to_string(), 3)?;
+        dst_dir
+            .create_file("a.txt".to_string(), "old".to_string(), 3)
+            .await?;
         dst_dir.copy_file_from("a.txt".to_string(), &src_a).await?;
 
         let a = dst_dir.get_file("a.txt").expect("a.txt");

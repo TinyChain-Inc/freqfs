@@ -200,6 +200,23 @@ pub struct Dir<FE> {
 }
 
 impl<FE: Send + Sync> Dir<FE> {
+    /// Create a zero-byte cache entry without capacity admission.
+    pub fn create_empty_file<F>(&mut self, name: String, contents: F) -> Result<FileLock<FE>>
+    where
+        FE: From<F>,
+    {
+        if self.deleted.remove(&name).is_some() {
+            #[cfg(feature = "logging")]
+            log::debug!("re-creating deleted file {} in {:?}", name, self.path);
+        }
+
+        let path = self.path.join(&name);
+        let lock = FileLock::new(self.cache.clone(), path.clone(), contents, 0);
+        self.contents.insert(name, DirEntry::File(lock.clone()));
+        self.cache.insert(path, lock.clone(), 0);
+        Ok(lock)
+    }
+
     /// Borrow the [`Path`] of this [`Dir`].
     pub fn path(&self) -> &Path {
         self.path.as_path()
@@ -322,7 +339,7 @@ impl<FE: Send + Sync> Dir<FE> {
     where
         Q: Name + fmt::Display + ?Sized,
         F: FileLoad,
-        FE: AsType<F>,
+        FE: AsType<F> + From<F>,
     {
         if let Some(file) = self.get_file(name) {
             file.read().await
@@ -337,7 +354,7 @@ impl<FE: Send + Sync> Dir<FE> {
     where
         Q: Name + fmt::Display + ?Sized,
         F: FileLoad,
-        FE: AsType<F>,
+        FE: AsType<F> + From<F>,
     {
         if let Some(file) = self.get_file(name) {
             file.read_owned().await
@@ -352,7 +369,7 @@ impl<FE: Send + Sync> Dir<FE> {
     where
         Q: Name + fmt::Display + ?Sized,
         F: FileLoad,
-        FE: AsType<F>,
+        FE: AsType<F> + From<F>,
     {
         if let Some(file) = self.get_file(name) {
             file.write().await
@@ -367,7 +384,7 @@ impl<FE: Send + Sync> Dir<FE> {
     where
         Q: Name + fmt::Display + ?Sized,
         F: FileLoad,
-        FE: AsType<F>,
+        FE: AsType<F> + From<F>,
     {
         if let Some(file) = self.get_file(name) {
             file.write_owned().await
@@ -379,7 +396,12 @@ impl<FE: Send + Sync> Dir<FE> {
 
 impl<FE: Send + Sync> Dir<FE> {
     /// Create a new file in this [`Dir`] with the given `contents`.
-    pub fn create_file<F>(&mut self, name: String, contents: F, size: usize) -> Result<FileLock<FE>>
+    pub async fn create_file<F>(
+        &mut self,
+        name: String,
+        contents: F,
+        size: usize,
+    ) -> Result<FileLock<FE>>
     where
         FE: From<F>,
     {
@@ -389,15 +411,16 @@ impl<FE: Send + Sync> Dir<FE> {
         }
 
         let path = self.path.join(&name);
+        let reservation = self.cache.reserve(size).await?;
 
         let lock = FileLock::new(self.cache.clone(), path.clone(), contents, size);
         self.contents.insert(name, DirEntry::File(lock.clone()));
-        self.cache.insert(path, lock.clone(), size);
+        self.cache.insert_reserved(path, lock.clone(), reservation);
         Ok(lock)
     }
 
     /// Create a new file in this [`Dir`] with a unique name and the given `contents`.
-    pub fn create_file_unique<F>(
+    pub async fn create_file_unique<F>(
         &mut self,
         contents: F,
         size: usize,
@@ -413,6 +436,7 @@ impl<FE: Send + Sync> Dir<FE> {
         }
 
         self.create_file(name, contents, size)
+            .await
             .map(|file| (uuid, file))
     }
 
@@ -756,7 +780,10 @@ impl<FE: Send + Sync> DirLock<FE> {
     /// Recursively delete empty entries in this [`Dir`].
     /// Returns the number of entries in this [`Dir`].
     #[async_recursion]
-    pub async fn trim(&self) -> Result<usize> {
+    pub async fn trim(&self) -> Result<usize>
+    where
+        FE: Send + Sync,
+    {
         let mut entries = self
             .try_write()
             .map_err(|cause| io::Error::new(io::ErrorKind::WouldBlock, cause))?;
@@ -785,7 +812,10 @@ impl<FE: Send + Sync> DirLock<FE> {
     }
 
     #[async_recursion]
-    async fn truncate(&self) {
+    async fn truncate(&self)
+    where
+        FE: Send + Sync,
+    {
         let mut state = self.state.write().await;
         state.truncate().await
     }
