@@ -89,8 +89,9 @@ async fn run_example(cache: DirLock<File>) -> Result<(), io::Error> {
 
         // create a new file "vector.bin"
         // this is a synchronous operation since it happens in-memory only
-        let binary_file =
-            sub_sub_dir.create_file("vector.bin".to_string(), (0..25).collect::<Vec<u8>>(), 25)?;
+        let binary_file = sub_sub_dir
+            .create_file("vector.bin".to_string(), (0..25).collect::<Vec<u8>>(), 25)
+            .await?;
 
         // then lock it so its data won't be evicted
         let binary_file: FileReadGuard<Vec<u8>> = binary_file.read().await?;
@@ -134,7 +135,7 @@ async fn main() -> Result<(), io::Error> {
     let path = setup_tmp_dir().await?;
 
     // initialize the cache
-    let cache = Cache::new(40, None);
+    let cache = Cache::new(128, None, 0, Duration::from_secs(3));
 
     // load the directory and file paths into memory (not file contents, yet)
     let root = cache.load(path.clone())?;

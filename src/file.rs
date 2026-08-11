@@ -1,14 +1,14 @@
 use futures::{join, Future, TryFutureExt};
 use safecast::AsType;
 use std::convert::TryInto;
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{fmt, io};
 use tokio::fs;
 use tokio::sync::{
-    OwnedRwLockMappedWriteGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock,
-    RwLockMappedWriteGuard, RwLockReadGuard, RwLockWriteGuard,
+    OwnedRwLockMappedWriteGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, OwnedSemaphorePermit,
+    RwLock, RwLockMappedWriteGuard, RwLockReadGuard, RwLockWriteGuard,
 };
 
 use super::cache::Cache;
@@ -16,17 +16,93 @@ use super::Result;
 
 const TMP: &str = "_freqfs";
 
-/// A read guard on a file
-pub type FileReadGuard<'a, F> = RwLockReadGuard<'a, F>;
+pub struct FileReadGuard<'a, F> {
+    guard: RwLockReadGuard<'a, F>,
+    _permit: OwnedSemaphorePermit,
+}
 
-/// An owned read guard on a file
-pub type FileReadGuardOwned<FE, F> = OwnedRwLockReadGuard<Option<FE>, F>;
+pub struct FileReadGuardOwned<FE, F> {
+    guard: OwnedRwLockReadGuard<Option<FE>, F>,
+    _permit: OwnedSemaphorePermit,
+}
 
-/// A write guard on a file
-pub type FileWriteGuard<'a, F> = RwLockMappedWriteGuard<'a, F>;
+pub struct FileWriteGuard<'a, F> {
+    guard: RwLockMappedWriteGuard<'a, F>,
+    _permit: OwnedSemaphorePermit,
+}
 
-/// An owned write guard on a file
-pub type FileWriteGuardOwned<FE, F> = OwnedRwLockMappedWriteGuard<Option<FE>, F>;
+pub struct FileWriteGuardOwned<FE, F> {
+    guard: OwnedRwLockMappedWriteGuard<Option<FE>, F>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl<'a, F> Deref for FileReadGuard<'a, F> {
+    type Target = F;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl<FE, F> Deref for FileReadGuardOwned<FE, F> {
+    type Target = F;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl<'a, F> Deref for FileWriteGuard<'a, F> {
+    type Target = F;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl<'a, F> DerefMut for FileWriteGuard<'a, F> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
+impl<FE, F> Deref for FileWriteGuardOwned<FE, F> {
+    type Target = F;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl<FE, F> DerefMut for FileWriteGuardOwned<FE, F> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
+impl<F: fmt::Debug> fmt::Debug for FileReadGuard<'_, F> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, formatter)
+    }
+}
+
+impl<FE, F: fmt::Debug> fmt::Debug for FileReadGuardOwned<FE, F> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, formatter)
+    }
+}
+
+impl<F: fmt::Debug> fmt::Debug for FileWriteGuard<'_, F> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, formatter)
+    }
+}
+
+impl<FE, F: fmt::Debug> fmt::Debug for FileWriteGuardOwned<FE, F> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, formatter)
+    }
+}
 
 /// A helper trait to coerce container types like [`Arc`] into a borrowed file.
 pub trait FileDeref {
@@ -183,6 +259,17 @@ impl<FE> Clone for FileLock<FE> {
 }
 
 impl<FE> FileLock<FE> {
+    async fn load_reserved<F>(&self) -> Result<(usize, FE, crate::cache::Reservation<FE>)>
+    where
+        F: FileLoad,
+        FE: AsType<F> + From<F>,
+    {
+        let (file, metadata, size) = open(&self.path, self.cache.capacity()).await?;
+        let reservation = self.cache.reserve(size).await?;
+        let entry = decode::<F, FE>(&self.path, file, metadata).await?;
+        Ok((size, entry, reservation))
+    }
+
     /// Create a new [`FileLock`].
     pub fn new<F>(cache: Arc<Cache<FE>>, path: PathBuf, contents: F, size: usize) -> Self
     where
@@ -269,7 +356,7 @@ impl<FE> FileLock<FE> {
             *this_data = Some(FE::clone(that_data));
         }
 
-        self.cache.resize(old_size, new_size);
+        self.cache.resize(old_size, new_size).await?;
 
         Ok(())
     }
@@ -278,8 +365,9 @@ impl<FE> FileLock<FE> {
     pub async fn read<F>(&self) -> Result<FileReadGuard<'_, F>>
     where
         F: FileLoad,
-        FE: AsType<F>,
+        FE: AsType<F> + From<F>,
     {
+        let permit = self.cache.acquire_file_handle().await?;
         let mut state = self.state.write().await;
 
         if state.is_deleted() {
@@ -288,9 +376,9 @@ impl<FE> FileLock<FE> {
 
         let guard = if state.is_pending() {
             let mut contents = self.contents.try_write().expect("file contents");
-            let (size, entry) = load(&self.path).await?;
-
-            self.cache.bump(&self.path, Some(size));
+            let (size, entry, reservation) = self.load_reserved::<F>().await?;
+            reservation.commit();
+            self.cache.bump(&self.path, None);
 
             *state = FileLockState::Read(size);
             *contents = Some(entry);
@@ -301,7 +389,10 @@ impl<FE> FileLock<FE> {
             self.contents.read().await
         };
 
-        read_type(guard)
+        read_type(guard).map(|guard| FileReadGuard {
+            guard,
+            _permit: permit,
+        })
     }
 
     /// Lock this file for reading synchronously if possible, otherwise return an error.
@@ -310,6 +401,7 @@ impl<FE> FileLock<FE> {
         F: FileLoad,
         FE: AsType<F>,
     {
+        let permit = self.cache.try_acquire_file_handle()?;
         let state = self.state.try_read().map_err(would_block)?;
 
         match &*state {
@@ -318,7 +410,10 @@ impl<FE> FileLock<FE> {
             FileLockState::Read(_size) | FileLockState::Modified(_size) => {
                 self.cache.bump(&self.path, None);
                 let guard = self.contents.try_read().map_err(would_block)?;
-                read_type(guard)
+                read_type(guard).map(|guard| FileReadGuard {
+                    guard,
+                    _permit: permit,
+                })
             }
         }
     }
@@ -327,8 +422,9 @@ impl<FE> FileLock<FE> {
     pub async fn read_owned<F>(&self) -> Result<FileReadGuardOwned<FE, F>>
     where
         F: FileLoad,
-        FE: AsType<F>,
+        FE: AsType<F> + From<F>,
     {
+        let permit = self.cache.acquire_file_handle().await?;
         let mut state = self.state.write().await;
 
         if state.is_deleted() {
@@ -342,9 +438,9 @@ impl<FE> FileLock<FE> {
                 .try_write_owned()
                 .expect("file contents");
 
-            let (size, entry) = load(&self.path).await?;
-
-            self.cache.bump(&self.path, Some(size));
+            let (size, entry, reservation) = self.load_reserved::<F>().await?;
+            reservation.commit();
+            self.cache.bump(&self.path, None);
 
             *state = FileLockState::Read(size);
             *contents = Some(entry);
@@ -355,7 +451,10 @@ impl<FE> FileLock<FE> {
             self.contents.clone().read_owned().await
         };
 
-        read_type_owned(guard)
+        read_type_owned(guard).map(|guard| FileReadGuardOwned {
+            guard,
+            _permit: permit,
+        })
     }
 
     /// Lock this file for reading synchronously if possible, otherwise return an error.
@@ -364,6 +463,7 @@ impl<FE> FileLock<FE> {
         F: FileLoad,
         FE: AsType<F>,
     {
+        let permit = self.cache.try_acquire_file_handle()?;
         let state = self.state.try_read().map_err(would_block)?;
 
         match &*state {
@@ -377,7 +477,10 @@ impl<FE> FileLock<FE> {
                     .try_read_owned()
                     .map_err(would_block)?;
 
-                read_type_owned(guard)
+                read_type_owned(guard).map(|guard| FileReadGuardOwned {
+                    guard,
+                    _permit: permit,
+                })
             }
         }
     }
@@ -386,8 +489,9 @@ impl<FE> FileLock<FE> {
     pub async fn into_read<F>(self) -> Result<FileReadGuardOwned<FE, F>>
     where
         F: FileLoad,
-        FE: AsType<F>,
+        FE: AsType<F> + From<F>,
     {
+        let permit = self.cache.acquire_file_handle().await?;
         let mut state = self.state.write().await;
 
         if state.is_deleted() {
@@ -395,10 +499,14 @@ impl<FE> FileLock<FE> {
         }
 
         let guard = if state.is_pending() {
-            let mut contents = self.contents.try_write_owned().expect("file contents");
-            let (size, entry) = load(&self.path).await?;
-
-            self.cache.bump(&self.path, Some(size));
+            let mut contents = self
+                .contents
+                .clone()
+                .try_write_owned()
+                .expect("file contents");
+            let (size, entry, reservation) = self.load_reserved::<F>().await?;
+            reservation.commit();
+            self.cache.bump(&self.path, None);
 
             *state = FileLockState::Read(size);
             *contents = Some(entry);
@@ -409,15 +517,19 @@ impl<FE> FileLock<FE> {
             self.contents.read_owned().await
         };
 
-        read_type_owned(guard)
+        read_type_owned(guard).map(|guard| FileReadGuardOwned {
+            guard,
+            _permit: permit,
+        })
     }
 
     /// Lock this file for writing.
     pub async fn write<F>(&self) -> Result<FileWriteGuard<'_, F>>
     where
         F: FileLoad,
-        FE: AsType<F>,
+        FE: AsType<F> + From<F>,
     {
+        let permit = self.cache.acquire_file_handle().await?;
         let mut state = self.state.write().await;
 
         if state.is_deleted() {
@@ -426,14 +538,12 @@ impl<FE> FileLock<FE> {
 
         let guard = if state.is_pending() {
             let mut contents = self.contents.try_write().expect("file contents");
-            let (size, entry) = load(&self.path).await?;
-
-            self.cache.bump(&self.path, Some(size));
+            let (size, entry, reservation) = self.load_reserved::<F>().await?;
+            reservation.commit();
+            self.cache.bump(&self.path, None);
 
             *state = FileLockState::Modified(size);
             *contents = Some(entry);
-
-            self.cache.bump(&self.path, Some(size));
 
             contents
         } else {
@@ -442,7 +552,10 @@ impl<FE> FileLock<FE> {
             self.contents.write().await
         };
 
-        write_type(guard)
+        write_type(guard).map(|guard| FileWriteGuard {
+            guard,
+            _permit: permit,
+        })
     }
 
     /// Lock this file for writing synchronously if possible, otherwise return an error.
@@ -451,6 +564,7 @@ impl<FE> FileLock<FE> {
         F: FileLoad,
         FE: AsType<F>,
     {
+        let permit = self.cache.try_acquire_file_handle()?;
         let mut state = self.state.try_write().map_err(would_block)?;
 
         if state.is_pending() {
@@ -461,7 +575,10 @@ impl<FE> FileLock<FE> {
             state.upgrade();
             self.cache.bump(&self.path, None);
             let guard = self.contents.try_write().map_err(would_block)?;
-            write_type(guard)
+            write_type(guard).map(|guard| FileWriteGuard {
+                guard,
+                _permit: permit,
+            })
         }
     }
 
@@ -469,8 +586,9 @@ impl<FE> FileLock<FE> {
     pub async fn write_owned<F>(&self) -> Result<FileWriteGuardOwned<FE, F>>
     where
         F: FileLoad,
-        FE: AsType<F>,
+        FE: AsType<F> + From<F>,
     {
+        let permit = self.cache.acquire_file_handle().await?;
         let mut state = self.state.write().await;
 
         if state.is_deleted() {
@@ -484,8 +602,9 @@ impl<FE> FileLock<FE> {
                 .try_write_owned()
                 .expect("file contents");
 
-            let (size, entry) = load(&self.path).await?;
-            self.cache.bump(&self.path, Some(size));
+            let (size, entry, reservation) = self.load_reserved::<F>().await?;
+            reservation.commit();
+            self.cache.bump(&self.path, None);
 
             *state = FileLockState::Modified(size);
             *contents = Some(entry);
@@ -497,7 +616,10 @@ impl<FE> FileLock<FE> {
             self.contents.clone().write_owned().await
         };
 
-        write_type_owned(guard)
+        write_type_owned(guard).map(|guard| FileWriteGuardOwned {
+            guard,
+            _permit: permit,
+        })
     }
 
     /// Lock this file for writing synchronously if possible, otherwise return an error.
@@ -505,6 +627,7 @@ impl<FE> FileLock<FE> {
     where
         FE: AsType<F>,
     {
+        let permit = self.cache.try_acquire_file_handle()?;
         let mut state = self.state.try_write().map_err(would_block)?;
 
         if state.is_pending() {
@@ -521,7 +644,10 @@ impl<FE> FileLock<FE> {
                 .try_write_owned()
                 .map_err(would_block)?;
 
-            write_type_owned(guard)
+            write_type_owned(guard).map(|guard| FileWriteGuardOwned {
+                guard,
+                _permit: permit,
+            })
         }
     }
 
@@ -529,7 +655,7 @@ impl<FE> FileLock<FE> {
     pub async fn into_write<F>(self) -> Result<FileWriteGuardOwned<FE, F>>
     where
         F: FileLoad,
-        FE: AsType<F>,
+        FE: AsType<F> + From<F>,
     {
         self.write_owned().await
     }
@@ -560,9 +686,11 @@ impl<FE> FileLock<FE> {
                 let contents = self.contents.read().await;
                 let contents = contents.as_ref().cloned().expect("file");
 
+                self.cache
+                    .ensure_disk_capacity(&self.path, *old_size as u64)?;
                 let new_size = persist(self.path.clone(), contents).await?;
 
-                self.cache.resize(*old_size, new_size as usize);
+                self.cache.resize(*old_size, new_size as usize).await?;
                 FileLockState::Read(new_size as usize)
             }
             FileLockState::Deleted(needs_sync) => {
@@ -620,13 +748,17 @@ impl<FE> FileLock<FE> {
         let eviction = async move {
             if modified {
                 let contents = contents.as_ref().cloned().expect("file");
+                self.cache
+                    .ensure_disk_capacity(&self.path, old_size as u64)?;
                 persist(self.path.clone(), contents).await?;
             }
 
-            // Cache size is adjusted by gc() while it holds Cache::state,
-            // so the eviction future only needs to transition the file state
-            // back to Pending. This avoids a File -> Cache lock ordering inversion.
             *state = FileLockState::Pending;
+            drop(state);
+            drop(contents);
+
+            // Never acquire Cache::state while holding a file or contents guard.
+            self.cache.resize(old_size, 0).await?;
             Ok(())
         };
 
@@ -646,7 +778,7 @@ impl<FE> fmt::Debug for FileLock<FE> {
     }
 }
 
-async fn load<F: FileLoad, FE: From<F>>(path: &Path) -> Result<(usize, FE)> {
+async fn open(path: &Path, capacity: usize) -> Result<(fs::File, std::fs::Metadata, usize)> {
     let file = match fs::File::open(path).await {
         Ok(file) => file,
         Err(cause) if cause.kind() == io::ErrorKind::NotFound => {
@@ -671,11 +803,22 @@ async fn load<F: FileLoad, FE: From<F>>(path: &Path) -> Result<(usize, FE)> {
             ))
         }
     };
+    if size > capacity {
+        return Err(io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            "this file exceeds the configured cache capacity",
+        ));
+    }
 
-    let file = F::load(path, file, metadata).await?;
-    let entry = FE::from(file);
+    Ok((file, metadata, size))
+}
 
-    Ok((size, entry))
+async fn decode<F: FileLoad, FE: From<F>>(
+    path: &Path,
+    file: fs::File,
+    metadata: std::fs::Metadata,
+) -> Result<FE> {
+    F::load(path, file, metadata).await.map(FE::from)
 }
 
 // TODO: use borrowed rather than owned parameters

@@ -38,12 +38,13 @@ async fn setup_tmp_dir() -> Result<PathBuf, io::Error> {
 async fn wrong_type_read_returns_invalid_data() -> Result<(), io::Error> {
     let path = setup_tmp_dir().await?;
 
-    let cache = Cache::<File>::new(1024 * 1024, None);
+    let cache = Cache::<File>::new(1024 * 1024, None, 0, std::time::Duration::from_secs(3));
     let root = cache.load(path.clone())?;
 
     let file = {
         let mut dir = root.write().await;
-        dir.create_file("data.bin".to_string(), vec![1u8, 2, 3], 3)?
+        dir.create_file("data.bin".to_string(), vec![1u8, 2, 3], 3)
+            .await?
     };
 
     let err = file.read::<String>().await.unwrap_err();
