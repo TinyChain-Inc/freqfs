@@ -542,37 +542,111 @@ impl<FE: Send + Sync> Dir<FE> {
     }
 
     /// Synchronize the contents of this directory with the filesystem.
-    #[async_recursion]
     pub async fn sync(&mut self) -> Result<()>
     where
         FE: FileSave + Clone,
     {
-        if self.contents.is_empty() {
-            self.deleted.clear();
+        self.sync_contents(false).await
+    }
 
-            if self.path.exists() {
-                delete_dir(self.path()).await
-            } else {
-                Ok(())
-            }
-        } else {
-            for (_name, entry) in self.deleted.drain() {
-                match entry {
-                    DirEntry::Dir(subdir) => {
-                        let subdir = subdir.write().await;
-                        delete_dir(subdir.path()).await?;
-                    }
-                    DirEntry::File(file) => file.sync().await?,
+    /// Make this subtree durable. The caller supplies a durably established root.
+    /// Child directory publication is synchronized once per containing directory.
+    pub async fn sync_all(&mut self) -> Result<()>
+    where
+        FE: FileSave + Clone,
+    {
+        self.sync_contents(true).await?;
+        // Standalone subtree calls also publish (or remove) this root's entry.
+        self.sync_parent().await
+    }
+
+    /// Apply pending deletions and make their removal durable without writing or
+    /// synchronizing surviving children. The containing directory is retained.
+    pub async fn sync_deleted(&mut self) -> Result<()>
+    where
+        FE: FileSave + Clone,
+    {
+        self.write_deletions().await?;
+        {
+            let _permit = self.cache.acquire_file_handle().await?;
+            match sync_directory(&self.path).await {
+                Ok(()) => {
+                    self.deleted.clear();
+                    return Ok(());
                 }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
             }
+        }
+        self.sync_parent().await?;
+        self.deleted.clear();
+        Ok(())
+    }
+
+    async fn sync_parent(&self) -> Result<()> {
+        let _permit = self.cache.acquire_file_handle().await?;
+        let mut parent = self.path.parent();
+        while let Some(path) = parent {
+            match sync_directory(path).await {
+                Ok(()) => break,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => parent = path.parent(),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    async fn write_deletions(&self) -> Result<()>
+    where
+        FE: FileSave + Clone,
+    {
+        for entry in self.deleted.values() {
+            match entry {
+                DirEntry::Dir(subdir) => {
+                    let subdir = subdir.write().await;
+                    delete_dir(subdir.path()).await?;
+                }
+                DirEntry::File(file) => file.sync().await?,
+            }
+        }
+        Ok(())
+    }
+
+    #[async_recursion]
+    async fn sync_contents(&mut self, durable: bool) -> Result<()>
+    where
+        FE: FileSave + Clone,
+    {
+        if self.contents.is_empty() {
+            delete_dir(self.path()).await?;
+            self.deleted.clear();
+            Ok(())
+        } else {
+            self.write_deletions().await?;
 
             for entry in self.contents.values() {
                 match entry {
-                    DirEntry::Dir(dir) => dir.sync().await?,
-                    DirEntry::File(file) => file.sync().await?,
+                    DirEntry::Dir(dir) => dir.write().await.sync_contents(durable).await?,
+                    DirEntry::File(file) => {
+                        if durable {
+                            file.sync_durable(false).await?;
+                        } else {
+                            file.sync().await?;
+                        }
+                    }
                 }
             }
 
+            if durable {
+                let _permit = self.cache.acquire_file_handle().await?;
+                match sync_directory(&self.path).await {
+                    Ok(()) => {}
+                    // Empty virtual descendants do not materialize their parent.
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            self.deleted.clear();
             Ok(())
         }
     }
@@ -668,6 +742,8 @@ impl<FE: Send + Sync> DirLock<FE> {
         log::trace!("load cached dir at {}", path.display());
 
         let mut contents = OrdHashMap::new();
+        // freqfs is the filesystem owner: this is the one-time canonical scan
+        // which constructs the cache before its handles are published.
         let handles = std::fs::read_dir(&path)?;
 
         for handle in handles {
@@ -768,13 +844,28 @@ impl<FE: Send + Sync> DirLock<FE> {
     }
 
     /// Synchronize the contents of this directory with the filesystem.
-    #[async_recursion]
     pub async fn sync(&self) -> Result<()>
     where
         FE: FileSave + Clone,
     {
         let mut dir = self.state.write().await;
         dir.sync().await
+    }
+
+    /// Explicit durable synchronization; ordinary `sync` is buffered writeback.
+    pub async fn sync_all(&self) -> Result<()>
+    where
+        FE: FileSave + Clone,
+    {
+        self.state.write().await.sync_all().await
+    }
+
+    /// Durably apply deletions without synchronizing surviving file contents.
+    pub async fn sync_deleted(&self) -> Result<()>
+    where
+        FE: FileSave + Clone,
+    {
+        self.state.write().await.sync_deleted().await
     }
 
     /// Recursively delete empty entries in this [`Dir`].
