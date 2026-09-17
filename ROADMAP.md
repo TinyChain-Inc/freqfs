@@ -1,5 +1,8 @@
 # freqfs Roadmap
 
+> **Non-normative:** this file tracks unimplemented work and cannot override
+> this repository's implemented behavior or local contracts.
+
 This roadmap captures planned work for `freqfs` as a cache/persistence primitive used across TinyChain services.
 
 ## Current focus
@@ -13,13 +16,15 @@ Status: deferred planning only. Do not implement yet.
 
 ### Why defer now
 
-Memory-mapped file I/O can reduce serialization/copy overhead for large synchronization workloads, but it is a high-risk optimization. The TinyChain ecosystem should first complete broader feature validation and stabilization before adding mmap-specific complexity.
+Memory-mapped file I/O can reduce serialization and copy overhead for large
+workloads, but it is a high-risk optimization. Existing persistence and cache
+behavior should be fully covered before adding mmap-specific complexity.
 
 ### Preconditions before implementation begins
 
-1. End-to-end TinyChain feature-set validation is complete for the current release scope.
-2. Existing `freqfs` atomic persistence guarantees are stable and covered by integration tests.
-3. Cross-crate consumers (`txfs`, `b-tree`, `b-table`, `fensor`, control-plane services) are green under CI and performance baselines are captured.
+1. Existing `freqfs` atomic persistence guarantees are covered by integration tests.
+2. Cache eviction, cancellation, and resource accounting have regression coverage.
+3. Performance baselines are captured for the supported platforms.
 
 ### Planned design direction (future)
 

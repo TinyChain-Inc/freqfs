@@ -35,6 +35,27 @@ async fn setup_tmp_dir() -> Result<PathBuf, io::Error> {
 }
 
 #[tokio::test]
+async fn sync_virtual_empty_hierarchy_then_publish_a_file() -> Result<(), io::Error> {
+    let path = setup_tmp_dir().await?;
+    let cache = Cache::<File>::new(1024 * 1024, None, 0, std::time::Duration::from_secs(3));
+    let root = cache.load(path.clone())?;
+    let parent = root.write().await.create_dir("parent".into())?;
+    let child = parent.write().await.create_dir("child".into())?;
+    root.sync_all().await?;
+    assert!(!path.join("parent").exists());
+
+    child
+        .write()
+        .await
+        .create_file("value".into(), "durable".to_owned(), 7)
+        .await?;
+    root.sync_all().await?;
+    assert!(path.join("parent/child/value").is_file());
+    fs::remove_dir_all(&path).await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn delete_then_recreate_file_and_dir() -> Result<(), io::Error> {
     let path = setup_tmp_dir().await?;
 

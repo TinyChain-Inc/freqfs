@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{fmt, io};
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{
     OwnedRwLockMappedWriteGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, OwnedSemaphorePermit,
     RwLock, RwLockMappedWriteGuard, RwLockReadGuard, RwLockWriteGuard,
@@ -15,6 +16,14 @@ use super::cache::Cache;
 use super::Result;
 
 const TMP: &str = "_freqfs";
+
+fn interrupted() -> io::Error {
+    io::Error::other("interrupted durable replacement; reopen the cache")
+}
+
+pub(crate) async fn sync_directory(path: &Path) -> Result<()> {
+    fs::File::open(path).await?.sync_all().await
+}
 
 pub struct FileReadGuard<'a, F> {
     guard: RwLockReadGuard<'a, F>,
@@ -214,9 +223,18 @@ enum FileLockState {
     Read(usize),
     Modified(usize),
     Deleted(bool),
+    Failed,
 }
 
 impl FileLockState {
+    fn check_available(&self) -> Result<()> {
+        match self {
+            Self::Failed => Err(interrupted()),
+            Self::Deleted(_) => Err(deleted()),
+            _ => Ok(()),
+        }
+    }
+
     fn is_deleted(&self) -> bool {
         matches!(self, Self::Deleted(_))
     }
@@ -309,12 +327,17 @@ impl<FE> FileLock<FE> {
     {
         let (mut this, that) = join!(self.state.write(), other.state.read());
 
+        if matches!(*this, FileLockState::Failed) || matches!(*that, FileLockState::Failed) {
+            return Err(interrupted());
+        }
         let old_size = match &*this {
             FileLockState::Pending | FileLockState::Deleted(_) => 0,
+            FileLockState::Failed => return Err(interrupted()),
             FileLockState::Read(size) | FileLockState::Modified(size) => *size,
         };
 
         let new_size = match &*that {
+            FileLockState::Failed => return Err(interrupted()),
             FileLockState::Pending => {
                 debug_assert!(other.path.exists());
 
@@ -370,9 +393,7 @@ impl<FE> FileLock<FE> {
         let permit = self.cache.acquire_file_handle().await?;
         let mut state = self.state.write().await;
 
-        if state.is_deleted() {
-            return Err(deleted());
-        }
+        state.check_available()?;
 
         let guard = if state.is_pending() {
             let mut contents = self.contents.try_write().expect("file contents");
@@ -407,6 +428,7 @@ impl<FE> FileLock<FE> {
         match &*state {
             FileLockState::Pending => Err(would_block("this file is not in the cache")),
             FileLockState::Deleted(_sync) => Err(deleted()),
+            FileLockState::Failed => Err(interrupted()),
             FileLockState::Read(_size) | FileLockState::Modified(_size) => {
                 self.cache.bump(&self.path, None);
                 let guard = self.contents.try_read().map_err(would_block)?;
@@ -427,9 +449,7 @@ impl<FE> FileLock<FE> {
         let permit = self.cache.acquire_file_handle().await?;
         let mut state = self.state.write().await;
 
-        if state.is_deleted() {
-            return Err(deleted());
-        }
+        state.check_available()?;
 
         let guard = if state.is_pending() {
             let mut contents = self
@@ -469,6 +489,7 @@ impl<FE> FileLock<FE> {
         match &*state {
             FileLockState::Pending => Err(would_block("this file is not in the cache")),
             FileLockState::Deleted(_sync) => Err(deleted()),
+            FileLockState::Failed => Err(interrupted()),
             FileLockState::Read(_size) | FileLockState::Modified(_size) => {
                 self.cache.bump(&self.path, None);
                 let guard = self
@@ -494,9 +515,7 @@ impl<FE> FileLock<FE> {
         let permit = self.cache.acquire_file_handle().await?;
         let mut state = self.state.write().await;
 
-        if state.is_deleted() {
-            return Err(deleted());
-        }
+        state.check_available()?;
 
         let guard = if state.is_pending() {
             let mut contents = self
@@ -532,9 +551,7 @@ impl<FE> FileLock<FE> {
         let permit = self.cache.acquire_file_handle().await?;
         let mut state = self.state.write().await;
 
-        if state.is_deleted() {
-            return Err(deleted());
-        }
+        state.check_available()?;
 
         let guard = if state.is_pending() {
             let mut contents = self.contents.try_write().expect("file contents");
@@ -567,10 +584,9 @@ impl<FE> FileLock<FE> {
         let permit = self.cache.try_acquire_file_handle()?;
         let mut state = self.state.try_write().map_err(would_block)?;
 
+        state.check_available()?;
         if state.is_pending() {
             Err(would_block("this file is not in the cache"))
-        } else if state.is_deleted() {
-            Err(deleted())
         } else {
             state.upgrade();
             self.cache.bump(&self.path, None);
@@ -591,9 +607,7 @@ impl<FE> FileLock<FE> {
         let permit = self.cache.acquire_file_handle().await?;
         let mut state = self.state.write().await;
 
-        if state.is_deleted() {
-            return Err(deleted());
-        }
+        state.check_available()?;
 
         let guard = if state.is_pending() {
             let mut contents = self
@@ -630,10 +644,9 @@ impl<FE> FileLock<FE> {
         let permit = self.cache.try_acquire_file_handle()?;
         let mut state = self.state.try_write().map_err(would_block)?;
 
+        state.check_available()?;
         if state.is_pending() {
             Err(would_block("this file is not in the cache"))
-        } else if state.is_deleted() {
-            Err(deleted())
         } else {
             state.upgrade();
             self.cache.bump(&self.path, None);
@@ -669,7 +682,7 @@ impl<FE> FileLock<FE> {
         self.try_write_owned()
     }
 
-    /// Back up this file's contents to the filesystem.
+    /// Write buffered contents to the filesystem without a durability barrier.
     pub async fn sync(&self) -> Result<()>
     where
         FE: FileSave + Clone,
@@ -677,6 +690,7 @@ impl<FE> FileLock<FE> {
         let mut state = self.state.write().await;
 
         let new_state = match &*state {
+            FileLockState::Failed => return Err(interrupted()),
             FileLockState::Pending => FileLockState::Pending,
             FileLockState::Read(size) => FileLockState::Read(*size),
             FileLockState::Modified(old_size) => {
@@ -693,8 +707,8 @@ impl<FE> FileLock<FE> {
                 self.cache.resize(*old_size, new_size as usize).await?;
                 FileLockState::Read(new_size as usize)
             }
-            FileLockState::Deleted(needs_sync) => {
-                if *needs_sync && self.path.exists() {
+            FileLockState::Deleted(pending_delete) => {
+                if *pending_delete {
                     delete_file(&self.path).await?;
                 }
 
@@ -707,10 +721,81 @@ impl<FE> FileLock<FE> {
         Ok(())
     }
 
+    /// Make this file's contents and its directory entry durable, including prior eviction.
+    pub async fn sync_all(&self) -> Result<()>
+    where
+        FE: FileSave + Clone,
+    {
+        self.sync_durable(true).await
+    }
+
+    pub(crate) async fn sync_durable(&self, parent: bool) -> Result<()>
+    where
+        FE: FileSave + Clone,
+    {
+        let _permit = self.cache.acquire_file_handle().await?;
+        self.sync().await?;
+        let state = self.state.write().await;
+        if matches!(*state, FileLockState::Failed) {
+            return Err(interrupted());
+        }
+        // A writer can enter between writeback and this lock. Do not acknowledge its data.
+        if matches!(*state, FileLockState::Modified(_)) {
+            return Err(would_block("file modified during durable synchronization"));
+        }
+        if !state.is_deleted() {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(self.path())
+                .await?
+                .sync_all()
+                .await?;
+        }
+        // A prior subtree barrier may have synchronized contents before failing
+        // on its directory. Always complete publication for standalone calls.
+        if parent {
+            sync_directory(self.path.parent().expect("file parent")).await?;
+        }
+        Ok(())
+    }
+
+    /// Atomically publish a durable replacement, admitting `size_hint` cache bytes
+    /// before work (as with directory file creation). Once publication begins,
+    /// error or cancellation requires reopening; access and eviction fail closed.
+    pub async fn replace_all(&self, value: FE, size_hint: usize) -> Result<()>
+    where
+        FE: FileSave + Clone,
+    {
+        let reservation = self.cache.reserve(size_hint).await?;
+        let _permit = self.cache.acquire_file_handle().await?;
+        let old_size = {
+            let mut state = self.state.write().await;
+            let old_size = match *state {
+                FileLockState::Read(size) | FileLockState::Modified(size) => size,
+                FileLockState::Pending => 0,
+                FileLockState::Failed => return Err(interrupted()),
+                FileLockState::Deleted(_) => return Err(deleted()),
+            };
+            let mut contents = self.contents.write().await;
+            self.cache
+                .ensure_disk_capacity(&self.path, size_hint as u64)?;
+            *state = FileLockState::Failed;
+            persist_with(self.path.clone(), value.clone(), true).await?;
+            *contents = Some(value);
+            reservation.commit();
+            *state = FileLockState::Read(size_hint);
+            old_size
+        };
+        // Release the replaced allocation outside the file's lock domain.
+        self.cache.resize(old_size, 0).await?;
+        Ok(())
+    }
+
     pub(crate) async fn delete(&self, file_only: bool) {
         let mut file_state = self.state.write().await;
 
         let size = match &*file_state {
+            FileLockState::Failed => return,
             FileLockState::Pending => 0,
             FileLockState::Read(size) => *size,
             FileLockState::Modified(size) => *size,
@@ -742,6 +827,7 @@ impl<FE> FileLock<FE> {
                 let contents = self.contents.try_write_owned().ok()?;
                 (*size, contents, true)
             }
+            FileLockState::Failed => return None,
             FileLockState::Deleted(_) => unreachable!("evict a deleted file"),
         };
 
@@ -800,7 +886,7 @@ async fn open(path: &Path, capacity: usize) -> Result<(fs::File, std::fs::Metada
             return Err(io::Error::new(
                 io::ErrorKind::OutOfMemory,
                 "this file is too large to load into the cache",
-            ))
+            ));
         }
     };
     if size > capacity {
@@ -824,6 +910,10 @@ async fn decode<F: FileLoad, FE: From<F>>(
 // TODO: use borrowed rather than owned parameters
 // when https://github.com/rust-lang/rust/issues/100013 is resolved
 async fn persist<FE: FileSave>(path: Arc<PathBuf>, file: FE) -> Result<u64> {
+    persist_with(path, file, false).await
+}
+
+async fn persist_with<FE: FileSave>(path: Arc<PathBuf>, file: FE, durable: bool) -> Result<u64> {
     let tmp = if let Some(ext) = path.extension().and_then(|ext| ext.to_str()) {
         path.with_extension(format!("{}_{}", ext, TMP))
     } else {
@@ -831,49 +921,33 @@ async fn persist<FE: FileSave>(path: Arc<PathBuf>, file: FE) -> Result<u64> {
     };
 
     let size = {
-        let mut tmp_file = if tmp.exists() {
-            fs::OpenOptions::new()
-                .truncate(true)
-                .write(true)
-                .open(tmp.as_path())
-                .await?
-        } else {
-            let parent = tmp.parent().expect("dir");
-            create_dir(parent).await?;
-
-            match fs::File::create(tmp.as_path()).await {
-                Ok(file) => file,
-                Err(cause) if cause.kind() == io::ErrorKind::NotFound => {
-                    // The parent directory may have been removed between
-                    // create_dir and File::create (TOCTOU race).
-                    // Retry directory creation then create the file.
-                    create_dir(parent).await?;
-                    fs::File::create(tmp.as_path())
-                        .map_err(|cause| {
-                            io::Error::new(
-                                cause.kind(),
-                                format!("failed to create tmp file: {}", cause),
-                            )
-                        })
-                        .await?
-                }
-                Err(cause) => {
-                    return Err(io::Error::new(
-                        cause.kind(),
-                        format!("failed to create tmp file: {}", cause),
-                    ))
-                }
+        let mut tmp_file = match fs::File::create(tmp.as_path()).await {
+            Err(cause) if cause.kind() == io::ErrorKind::NotFound => {
+                create_dir(tmp.parent().expect("dir")).await?;
+                fs::File::create(tmp.as_path()).await
             }
-        };
+            result => result,
+        }
+        .map_err(|cause| {
+            io::Error::new(
+                cause.kind(),
+                format!("failed to create tmp file: {}", cause),
+            )
+        })?;
 
-        assert!(tmp.exists());
-        assert!(!tmp.is_dir());
-
-        file.save(&mut tmp_file)
+        let size = file
+            .save(&mut tmp_file)
             .map_err(|cause| {
                 io::Error::new(cause.kind(), format!("failed to save tmp file: {}", cause))
             })
-            .await?
+            .await?;
+        // Complete Tokio's buffered writes before publishing the name. This is
+        // writeback, not a durability barrier, and also propagates delayed errors.
+        tmp_file.flush().await?;
+        if durable {
+            tmp_file.sync_all().await?;
+        }
+        size
     };
 
     tokio::fs::rename(tmp.as_path(), path.as_path())
@@ -885,6 +959,9 @@ async fn persist<FE: FileSave>(path: Arc<PathBuf>, file: FE) -> Result<u64> {
         })
         .await?;
 
+    if durable {
+        sync_directory(path.parent().expect("file parent")).await?;
+    }
     Ok(size)
 }
 
@@ -1006,7 +1083,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{persist, FileSave};
+    use super::{persist, FileLoad, FileLockState, FileSave};
     use std::path::PathBuf;
     use std::sync::Arc;
     use tokio::fs;
@@ -1016,6 +1093,233 @@ mod tests {
         let mut path = std::env::temp_dir();
         path.push(format!("freqfs_test_file_{}", uuid::Uuid::new_v4()));
         path
+    }
+
+    #[derive(Clone)]
+    struct Data {
+        bytes: Vec<u8>,
+        pause: Option<Arc<tokio::sync::Notify>>,
+        fail: bool,
+        unlink: Option<PathBuf>,
+    }
+    impl Data {
+        fn new(bytes: &[u8]) -> Self {
+            Self {
+                bytes: bytes.to_vec(),
+                pause: None,
+                fail: false,
+                unlink: None,
+            }
+        }
+    }
+    impl safecast::AsType<Data> for Data {
+        fn as_type(&self) -> Option<&Data> {
+            Some(self)
+        }
+        fn as_type_mut(&mut self) -> Option<&mut Data> {
+            Some(self)
+        }
+        fn into_type(self) -> Option<Data> {
+            Some(self)
+        }
+    }
+    impl FileLoad for Data {
+        async fn load(
+            _: &std::path::Path,
+            mut file: fs::File,
+            _: std::fs::Metadata,
+        ) -> crate::Result<Self> {
+            use tokio::io::AsyncReadExt;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).await?;
+            Ok(Self::new(&bytes))
+        }
+    }
+    impl FileSave for Data {
+        async fn save(&self, file: &mut fs::File) -> crate::Result<u64> {
+            file.write_all(&self.bytes).await?;
+            if let Some(path) = &self.unlink {
+                fs::remove_file(path).await?;
+            }
+            if let Some(started) = &self.pause {
+                started.notify_one();
+                std::future::pending::<()>().await;
+            }
+            if self.fail {
+                return Err(std::io::Error::other("injected save failure"));
+            }
+            Ok(self.bytes.len() as u64)
+        }
+    }
+
+    #[tokio::test]
+    async fn buffered_writeback_and_eviction_have_no_durability_barriers() -> crate::Result<()> {
+        let path = unique_tmp_dir();
+        fs::create_dir(&path).await?;
+        let cache = crate::Cache::<Data>::new(1024, None, 0, std::time::Duration::from_secs(1));
+        let root = cache.load(path.clone())?;
+        let file = root
+            .write()
+            .await
+            .create_file("data".into(), Data::new(b"old"), 3)
+            .await?;
+        root.sync().await?;
+        *file.write::<Data>().await? = Data::new(b"new");
+        file.clone().evict().unwrap().1.await?;
+        assert_eq!(fs::read(path.join("data")).await?, b"new");
+        fs::remove_dir_all(path).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_durable_sync_covers_eviction_and_repeated_calls() -> crate::Result<()> {
+        let path = unique_tmp_dir();
+        fs::create_dir(&path).await?;
+        let cache = crate::Cache::<Data>::new(1024, Some(1), 0, std::time::Duration::from_secs(1));
+        let root = cache.load(path.clone())?;
+        let file = root
+            .write()
+            .await
+            .create_file("data".into(), Data::new(b"old"), 3)
+            .await?;
+        file.sync().await?;
+        file.clone().evict().unwrap().1.await?;
+        assert!(matches!(*file.state.read().await, FileLockState::Pending));
+        file.sync_all().await?;
+        file.sync_all().await?;
+        *file.write::<Data>().await? = Data::new(b"new");
+        file.clone().evict().unwrap().1.await?;
+        root.sync_all().await?;
+        assert_eq!(fs::read(path.join("data")).await?, b"new");
+        root.write().await.delete("data").await;
+        root.sync_all().await?;
+        assert!(!path.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn durable_sync_waits_for_an_active_writer() -> crate::Result<()> {
+        let path = unique_tmp_dir();
+        fs::create_dir(&path).await?;
+        let cache = crate::Cache::<Data>::new(1024, Some(2), 0, std::time::Duration::from_secs(1));
+        let root = cache.load(path.clone())?;
+        let file = root
+            .write()
+            .await
+            .create_file("data".into(), Data::new(b"old"), 3)
+            .await?;
+        let mut writer = file.write::<Data>().await?;
+        *writer = Data::new(b"new");
+        let mut task = tokio::spawn({
+            let file = file.clone();
+            async move { file.sync_all().await }
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut task)
+                .await
+                .is_err()
+        );
+        drop(writer);
+        task.await.unwrap()?;
+        assert_eq!(fs::read(path.join("data")).await?, b"new");
+        fs::remove_dir_all(path).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn durable_directory_batches_file_publication() -> crate::Result<()> {
+        let path = unique_tmp_dir();
+        fs::create_dir(&path).await?;
+        let cache = crate::Cache::<Data>::new(1024, Some(1), 0, std::time::Duration::from_secs(1));
+        let root = cache.load(path.clone())?;
+        let nested = root.write().await.create_dir("nested".into())?;
+        for name in ["a", "b"] {
+            nested
+                .write()
+                .await
+                .create_file(name.into(), Data::new(b"data"), 4)
+                .await?;
+        }
+        root.sync_all().await?;
+        root.sync_all().await?;
+        let survivor = nested.read().await.get_file("b").unwrap().clone();
+        *survivor.write::<Data>().await? = Data::new(b"next");
+        nested.write().await.delete("a").await;
+        nested.sync_deleted().await?;
+        assert!(!path.join("nested/a").exists());
+        assert_eq!(fs::read(path.join("nested/b")).await?, b"data");
+        assert_eq!(survivor.read::<Data>().await?.bytes, b"next");
+        root.write().await.delete("nested").await;
+        root.sync_deleted().await?;
+        assert!(!path.join("nested").exists());
+        assert!(path.exists());
+        fs::remove_dir_all(path).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires strace -e inject=fsync:error=EIO:when=1 or when=2"]
+    async fn durable_replacement_syscall_failure_requires_reopen() -> crate::Result<()> {
+        let path = unique_tmp_dir();
+        fs::create_dir(&path).await?;
+        fs::write(path.join("data"), b"old").await?;
+        let cache = crate::Cache::<Data>::new(1024, None, 0, std::time::Duration::from_secs(1));
+        let root = cache.load(path.clone())?;
+        let file = root.read().await.get_file("data").unwrap().clone();
+        assert!(file.replace_all(Data::new(b"new"), 3).await.is_err());
+        assert!(file.read::<Data>().await.is_err());
+        assert!(file.clone().evict().is_none());
+        let contents = fs::read(path.join("data")).await?;
+        assert!(contents == b"old" || contents == b"new");
+        let reopened = crate::Cache::<Data>::new(1024, None, 0, std::time::Duration::from_secs(1))
+            .load(path.clone())?;
+        let current = reopened.read().await.get_file("data").unwrap().clone();
+        assert_eq!(current.read::<Data>().await?.bytes, contents);
+        fs::remove_dir_all(path).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn durable_replacement_excludes_eviction_and_fails_closed() -> crate::Result<()> {
+        for failure in 0..3 {
+            let path = unique_tmp_dir();
+            fs::create_dir(&path).await?;
+            let cache = crate::Cache::<Data>::new(1024, None, 0, std::time::Duration::from_secs(1));
+            let root = cache.load(path.clone())?;
+            let file = root
+                .write()
+                .await
+                .create_file("data".into(), Data::new(b"old"), 3)
+                .await?;
+            file.sync_all().await?;
+            assert!(file.replace_all(Data::new(b"new"), 2048).await.is_err());
+            assert_eq!(file.read::<Data>().await?.bytes, b"old");
+            assert!(!path.join("data._freqfs").exists());
+            let started = Arc::new(tokio::sync::Notify::new());
+            let mut replacement = Data::new(b"new");
+            replacement.fail = failure == 0;
+            replacement.unlink = (failure == 1).then(|| path.join("data._freqfs"));
+            replacement.pause = (failure == 2).then(|| started.clone());
+            if failure == 2 {
+                let task = tokio::spawn({
+                    let file = file.clone();
+                    async move { file.replace_all(replacement, 3).await }
+                });
+                started.notified().await;
+                assert!(file.clone().evict().is_none());
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+            } else {
+                assert!(file.replace_all(replacement, 3).await.is_err());
+            }
+            assert!(file.clone().evict().is_none());
+            assert!(file.read::<Data>().await.is_err());
+            assert!(file.write::<Data>().await.is_err());
+            assert!(file.sync_all().await.is_err());
+            assert_eq!(fs::read(path.join("data")).await?, b"old");
+            fs::remove_dir_all(path).await?;
+        }
+        Ok(())
     }
 
     struct PartialThenFail {
@@ -1050,6 +1354,10 @@ mod tests {
 
         assert_eq!(err.kind(), std::io::ErrorKind::Other);
         assert_eq!(fs::read(&path).await?, b"original");
+
+        persist(Arc::new(path.clone()), Data::new(b"x")).await?;
+        assert_eq!(fs::read(&path).await?, b"x");
+        assert!(!path.with_extension("txt_freqfs").exists());
 
         let _ = fs::remove_dir_all(&tmp).await;
         Ok(())
