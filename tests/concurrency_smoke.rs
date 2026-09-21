@@ -1,10 +1,8 @@
-#![cfg(feature = "stream")]
-
 use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use destream::en;
+use destream::{de, en};
 use safecast::as_type;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
@@ -15,6 +13,23 @@ use freqfs::*;
 #[derive(Clone)]
 enum File {
     Text(String),
+}
+
+impl de::FromStream for File {
+    type Context = ();
+    async fn from_stream<D: de::Decoder>(_: (), decoder: &mut D) -> Result<Self, D::Error> {
+        decoder.decode_any(FileVisitor).await
+    }
+}
+struct FileVisitor;
+impl de::Visitor for FileVisitor {
+    type Value = File;
+    fn expecting() -> &'static str {
+        "a filesystem entry"
+    }
+    fn visit_string<E: de::Error>(self, value: String) -> Result<File, E> {
+        Ok(File::Text(value))
+    }
 }
 
 impl<'en> en::ToStream<'en> for File {
@@ -88,4 +103,29 @@ async fn concurrent_read_write_does_not_deadlock() -> Result<(), io::Error> {
 
     let _ = fs::remove_dir_all(&path).await;
     Ok(())
+}
+
+impl freqfs::FileLoad for File {
+    async fn load(
+        _: &std::path::Path,
+        file: tokio::fs::File,
+        _: std::fs::Metadata,
+    ) -> std::io::Result<Self> {
+        tbon::de::read_from((), file)
+            .await
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+}
+impl freqfs::FileSave for File {
+    async fn save(&self, file: &mut tokio::fs::File) -> std::io::Result<u64> {
+        use futures::TryStreamExt;
+        use tokio::io::AsyncWriteExt;
+        let mut stream = tbon::en::encode(self).map_err(std::io::Error::other)?;
+        let mut size = 0;
+        while let Some(chunk) = stream.try_next().await.map_err(std::io::Error::other)? {
+            file.write_all(&chunk).await?;
+            size += chunk.len() as u64;
+        }
+        Ok(size)
+    }
 }

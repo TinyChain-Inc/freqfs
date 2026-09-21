@@ -13,30 +13,26 @@ keywords = ["file", "io", "cache"]
 
 [[example]]
 name = "example"
-required-features = ["stream"]
 
 [features]
-all = ["id", "logging", "stream"]
+all = ["id", "logging"]
 id = ["hr-id"]
 logging = ["log"]
-stream = ["bytes", "destream", "tbon", "tokio-util"]
 
 [dependencies]
 async-recursion = "1.1"
-bytes = { version = "1.7", optional = true }
-destream = { path = "../destream", version = "0.10.1", optional = true }
 ds-ext = { path = "../ds-ext", version = "0.4" }
 futures = "0.3"
 fs2 = "0.4"
 hr-id = { path = "../hr-id", version = "0.7.0", optional = true }
 log = { version = "0.4", optional = true }
 safecast = "0.2"
-tbon = { path = "../tbon", version = "0.9.0", features = ["tokio-io"], optional = true }
 tokio = { version = "1.39", features = ["fs", "io-util", "rt-multi-thread", "sync", "time"] }
-tokio-util = { version = "0.7", features = ["io"], optional = true }
 trait-variant = "0.1"
 uuid = { version = "1.10", features = ["v4"] }
 
 [dev-dependencies]
+destream = { path = "../destream", version = "0.10.1" }
+tbon = { path = "../tbon", version = "0.9", features = ["tokio-io"] }
 rand = "0.9"
 tokio = { version = "1.39", features = ["macros"] }

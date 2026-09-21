@@ -338,8 +338,8 @@ impl<FE: Send + Sync> Dir<FE> {
     pub async fn read_file<Q, F>(&self, name: &Q) -> Result<FileReadGuard<'_, F>>
     where
         Q: Name + fmt::Display + ?Sized,
-        F: FileLoad,
-        FE: AsType<F> + From<F>,
+        F: Send + Sync + 'static,
+        FE: FileLoad + AsType<F> + From<F>,
     {
         if let Some(file) = self.get_file(name) {
             file.read().await
@@ -353,8 +353,8 @@ impl<FE: Send + Sync> Dir<FE> {
     pub async fn read_file_owned<Q, F>(&self, name: &Q) -> Result<FileReadGuardOwned<FE, F>>
     where
         Q: Name + fmt::Display + ?Sized,
-        F: FileLoad,
-        FE: AsType<F> + From<F>,
+        F: Send + Sync + 'static,
+        FE: FileLoad + AsType<F> + From<F>,
     {
         if let Some(file) = self.get_file(name) {
             file.read_owned().await
@@ -368,8 +368,8 @@ impl<FE: Send + Sync> Dir<FE> {
     pub async fn write_file<Q, F>(&self, name: &Q) -> Result<FileWriteGuard<'_, F>>
     where
         Q: Name + fmt::Display + ?Sized,
-        F: FileLoad,
-        FE: AsType<F> + From<F>,
+        F: Send + Sync + 'static,
+        FE: FileLoad + AsType<F> + From<F>,
     {
         if let Some(file) = self.get_file(name) {
             file.write().await
@@ -383,8 +383,8 @@ impl<FE: Send + Sync> Dir<FE> {
     pub async fn write_file_owned<Q, F>(&self, name: &Q) -> Result<FileWriteGuardOwned<FE, F>>
     where
         Q: Name + fmt::Display + ?Sized,
-        F: FileLoad,
-        FE: AsType<F> + From<F>,
+        F: Send + Sync + 'static,
+        FE: FileLoad + AsType<F> + From<F>,
     {
         if let Some(file) = self.get_file(name) {
             file.write_owned().await
@@ -766,6 +766,7 @@ impl<FE: Send + Sync> DirLock<FE> {
                 contents.insert(name, DirEntry::Dir(subdirectory));
             } else if meta.is_file() {
                 let file = FileLock::load(cache.clone(), handle.path());
+                cache.insert(handle.path(), file.clone(), 0);
                 contents.insert(name, DirEntry::File(file));
             } else {
                 unreachable!("{:?} is neither a directory nor a file", handle.path());
