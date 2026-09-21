@@ -412,8 +412,7 @@ mod tests {
 
     as_type!(Entry, Bin, Vec<u8>);
 
-    #[cfg(not(feature = "stream"))]
-    impl crate::file::FileLoad for Vec<u8> {
+    impl crate::file::FileLoad for Entry {
         async fn load(
             _path: &std::path::Path,
             mut file: tokio::fs::File,
@@ -423,7 +422,7 @@ mod tests {
 
             let mut bytes = Vec::new();
             file.read_to_end(&mut bytes).await?;
-            Ok(bytes)
+            Ok(Self::Bin(bytes))
         }
     }
 

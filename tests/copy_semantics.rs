@@ -1,10 +1,8 @@
-#![cfg(feature = "stream")]
-
 use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use destream::en;
+use destream::{de, en};
 use safecast::as_type;
 use tokio::fs;
 
@@ -14,6 +12,30 @@ use freqfs::*;
 enum File {
     Bin(Vec<u8>),
     Text(String),
+}
+
+impl de::FromStream for File {
+    type Context = ();
+    async fn from_stream<D: de::Decoder>(_: (), decoder: &mut D) -> Result<Self, D::Error> {
+        decoder.decode_any(FileVisitor).await
+    }
+}
+struct FileVisitor;
+impl de::Visitor for FileVisitor {
+    type Value = File;
+    fn expecting() -> &'static str {
+        "a filesystem entry"
+    }
+    fn visit_string<E: de::Error>(self, value: String) -> Result<File, E> {
+        Ok(File::Text(value))
+    }
+    async fn visit_seq<A: de::SeqAccess>(self, mut seq: A) -> Result<File, A::Error> {
+        let mut bytes = Vec::new();
+        while let Some(byte) = seq.next_element::<u8>(()).await? {
+            bytes.push(byte);
+        }
+        Ok(File::Bin(bytes))
+    }
 }
 
 impl<'en> en::ToStream<'en> for File {
@@ -113,4 +135,29 @@ async fn copy_dir_from_preserves_tree_and_contents() -> Result<(), io::Error> {
 
     let _ = fs::remove_dir_all(&path).await;
     Ok(())
+}
+
+impl freqfs::FileLoad for File {
+    async fn load(
+        _: &std::path::Path,
+        file: tokio::fs::File,
+        _: std::fs::Metadata,
+    ) -> std::io::Result<Self> {
+        tbon::de::read_from((), file)
+            .await
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+}
+impl freqfs::FileSave for File {
+    async fn save(&self, file: &mut tokio::fs::File) -> std::io::Result<u64> {
+        use futures::TryStreamExt;
+        use tokio::io::AsyncWriteExt;
+        let mut stream = tbon::en::encode(self).map_err(std::io::Error::other)?;
+        let mut size = 0;
+        while let Some(chunk) = stream.try_next().await.map_err(std::io::Error::other)? {
+            file.write_all(&chunk).await?;
+            size += chunk.len() as u64;
+        }
+        Ok(size)
+    }
 }

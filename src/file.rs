@@ -184,39 +184,6 @@ pub trait FileSave: Send + Sync + Sized + 'static {
     async fn save(&self, file: &mut fs::File) -> Result<u64>;
 }
 
-#[cfg(feature = "stream")]
-impl<T> FileLoad for T
-where
-    T: destream::de::FromStream<Context = ()> + Send + Sync + 'static,
-{
-    async fn load(_path: &Path, file: fs::File, _metadata: std::fs::Metadata) -> Result<Self> {
-        tbon::de::read_from((), file)
-            .map_err(|cause| io::Error::new(io::ErrorKind::InvalidData, cause))
-            .await
-    }
-}
-
-#[cfg(feature = "stream")]
-impl<T> FileSave for T
-where
-    T: for<'en> destream::en::ToStream<'en> + Send + Sync + 'static,
-{
-    async fn save(&self, file: &mut fs::File) -> Result<u64> {
-        use futures::TryStreamExt;
-
-        let encoded = tbon::en::encode(self)
-            .map_err(|cause| io::Error::new(io::ErrorKind::InvalidData, cause))?;
-
-        let mut reader = tokio_util::io::StreamReader::new(
-            encoded
-                .map_ok(bytes::Bytes::from)
-                .map_err(|cause| io::Error::new(io::ErrorKind::InvalidData, cause)),
-        );
-
-        tokio::io::copy(&mut reader, file).await
-    }
-}
-
 #[derive(Copy, Clone)]
 enum FileLockState {
     Pending,
@@ -277,14 +244,13 @@ impl<FE> Clone for FileLock<FE> {
 }
 
 impl<FE> FileLock<FE> {
-    async fn load_reserved<F>(&self) -> Result<(usize, FE, crate::cache::Reservation<FE>)>
+    async fn load_reserved(&self) -> Result<(usize, FE, crate::cache::Reservation<FE>)>
     where
-        F: FileLoad,
-        FE: AsType<F> + From<F>,
+        FE: FileLoad,
     {
         let (file, metadata, size) = open(&self.path, self.cache.capacity()).await?;
         let reservation = self.cache.reserve(size).await?;
-        let entry = decode::<F, FE>(&self.path, file, metadata).await?;
+        let entry = FE::load(&self.path, file, metadata).await?;
         Ok((size, entry, reservation))
     }
 
@@ -387,8 +353,8 @@ impl<FE> FileLock<FE> {
     /// Lock this file for reading.
     pub async fn read<F>(&self) -> Result<FileReadGuard<'_, F>>
     where
-        F: FileLoad,
-        FE: AsType<F> + From<F>,
+        F: Send + Sync + 'static,
+        FE: FileLoad + AsType<F> + From<F>,
     {
         let permit = self.cache.acquire_file_handle().await?;
         let mut state = self.state.write().await;
@@ -397,7 +363,7 @@ impl<FE> FileLock<FE> {
 
         let guard = if state.is_pending() {
             let mut contents = self.contents.try_write().expect("file contents");
-            let (size, entry, reservation) = self.load_reserved::<F>().await?;
+            let (size, entry, reservation) = self.load_reserved().await?;
             reservation.commit();
             self.cache.bump(&self.path, None);
 
@@ -419,8 +385,8 @@ impl<FE> FileLock<FE> {
     /// Lock this file for reading synchronously if possible, otherwise return an error.
     pub fn try_read<F>(&self) -> Result<FileReadGuard<'_, F>>
     where
-        F: FileLoad,
-        FE: AsType<F>,
+        F: Send + Sync + 'static,
+        FE: FileLoad + AsType<F>,
     {
         let permit = self.cache.try_acquire_file_handle()?;
         let state = self.state.try_read().map_err(would_block)?;
@@ -443,8 +409,8 @@ impl<FE> FileLock<FE> {
     /// Lock this file for reading.
     pub async fn read_owned<F>(&self) -> Result<FileReadGuardOwned<FE, F>>
     where
-        F: FileLoad,
-        FE: AsType<F> + From<F>,
+        F: Send + Sync + 'static,
+        FE: FileLoad + AsType<F> + From<F>,
     {
         let permit = self.cache.acquire_file_handle().await?;
         let mut state = self.state.write().await;
@@ -458,7 +424,7 @@ impl<FE> FileLock<FE> {
                 .try_write_owned()
                 .expect("file contents");
 
-            let (size, entry, reservation) = self.load_reserved::<F>().await?;
+            let (size, entry, reservation) = self.load_reserved().await?;
             reservation.commit();
             self.cache.bump(&self.path, None);
 
@@ -480,8 +446,8 @@ impl<FE> FileLock<FE> {
     /// Lock this file for reading synchronously if possible, otherwise return an error.
     pub fn try_read_owned<F>(&self) -> Result<FileReadGuardOwned<FE, F>>
     where
-        F: FileLoad,
-        FE: AsType<F>,
+        F: Send + Sync + 'static,
+        FE: FileLoad + AsType<F>,
     {
         let permit = self.cache.try_acquire_file_handle()?;
         let state = self.state.try_read().map_err(would_block)?;
@@ -509,8 +475,8 @@ impl<FE> FileLock<FE> {
     /// Lock this file for reading, without borrowing.
     pub async fn into_read<F>(self) -> Result<FileReadGuardOwned<FE, F>>
     where
-        F: FileLoad,
-        FE: AsType<F> + From<F>,
+        F: Send + Sync + 'static,
+        FE: FileLoad + AsType<F> + From<F>,
     {
         let permit = self.cache.acquire_file_handle().await?;
         let mut state = self.state.write().await;
@@ -523,7 +489,7 @@ impl<FE> FileLock<FE> {
                 .clone()
                 .try_write_owned()
                 .expect("file contents");
-            let (size, entry, reservation) = self.load_reserved::<F>().await?;
+            let (size, entry, reservation) = self.load_reserved().await?;
             reservation.commit();
             self.cache.bump(&self.path, None);
 
@@ -545,8 +511,8 @@ impl<FE> FileLock<FE> {
     /// Lock this file for writing.
     pub async fn write<F>(&self) -> Result<FileWriteGuard<'_, F>>
     where
-        F: FileLoad,
-        FE: AsType<F> + From<F>,
+        F: Send + Sync + 'static,
+        FE: FileLoad + AsType<F> + From<F>,
     {
         let permit = self.cache.acquire_file_handle().await?;
         let mut state = self.state.write().await;
@@ -555,7 +521,7 @@ impl<FE> FileLock<FE> {
 
         let guard = if state.is_pending() {
             let mut contents = self.contents.try_write().expect("file contents");
-            let (size, entry, reservation) = self.load_reserved::<F>().await?;
+            let (size, entry, reservation) = self.load_reserved().await?;
             reservation.commit();
             self.cache.bump(&self.path, None);
 
@@ -578,8 +544,8 @@ impl<FE> FileLock<FE> {
     /// Lock this file for writing synchronously if possible, otherwise return an error.
     pub fn try_write<F>(&self) -> Result<FileWriteGuard<'_, F>>
     where
-        F: FileLoad,
-        FE: AsType<F>,
+        F: Send + Sync + 'static,
+        FE: FileLoad + AsType<F>,
     {
         let permit = self.cache.try_acquire_file_handle()?;
         let mut state = self.state.try_write().map_err(would_block)?;
@@ -601,8 +567,8 @@ impl<FE> FileLock<FE> {
     /// Lock this file for writing.
     pub async fn write_owned<F>(&self) -> Result<FileWriteGuardOwned<FE, F>>
     where
-        F: FileLoad,
-        FE: AsType<F> + From<F>,
+        F: Send + Sync + 'static,
+        FE: FileLoad + AsType<F> + From<F>,
     {
         let permit = self.cache.acquire_file_handle().await?;
         let mut state = self.state.write().await;
@@ -616,7 +582,7 @@ impl<FE> FileLock<FE> {
                 .try_write_owned()
                 .expect("file contents");
 
-            let (size, entry, reservation) = self.load_reserved::<F>().await?;
+            let (size, entry, reservation) = self.load_reserved().await?;
             reservation.commit();
             self.cache.bump(&self.path, None);
 
@@ -667,8 +633,8 @@ impl<FE> FileLock<FE> {
     /// Lock this file for writing, without borrowing.
     pub async fn into_write<F>(self) -> Result<FileWriteGuardOwned<FE, F>>
     where
-        F: FileLoad,
-        FE: AsType<F> + From<F>,
+        F: Send + Sync + 'static,
+        FE: FileLoad + AsType<F> + From<F>,
     {
         self.write_owned().await
     }
@@ -676,8 +642,8 @@ impl<FE> FileLock<FE> {
     /// Lock this file for writing synchronously, if possible, without borrowing.
     pub fn try_into_write<F>(self) -> Result<FileWriteGuardOwned<FE, F>>
     where
-        F: FileLoad,
-        FE: AsType<F>,
+        F: Send + Sync + 'static,
+        FE: FileLoad + AsType<F>,
     {
         self.try_write_owned()
     }
@@ -762,6 +728,7 @@ impl<FE> FileLock<FE> {
     /// Atomically publish a durable replacement, admitting `size_hint` cache bytes
     /// before work (as with directory file creation). Once publication begins,
     /// error or cancellation requires reopening; access and eviction fail closed.
+    /// Encoding borrows the supplied replacement under exclusive ownership.
     pub async fn replace_all(&self, value: FE, size_hint: usize) -> Result<()>
     where
         FE: FileSave + Clone,
@@ -780,7 +747,7 @@ impl<FE> FileLock<FE> {
             self.cache
                 .ensure_disk_capacity(&self.path, size_hint as u64)?;
             *state = FileLockState::Failed;
-            persist_with(self.path.clone(), value.clone(), true).await?;
+            persist_with(self.path.clone(), &value, true).await?;
             *contents = Some(value);
             reservation.commit();
             *state = FileLockState::Read(size_hint);
@@ -899,21 +866,11 @@ async fn open(path: &Path, capacity: usize) -> Result<(fs::File, std::fs::Metada
     Ok((file, metadata, size))
 }
 
-async fn decode<F: FileLoad, FE: From<F>>(
-    path: &Path,
-    file: fs::File,
-    metadata: std::fs::Metadata,
-) -> Result<FE> {
-    F::load(path, file, metadata).await.map(FE::from)
-}
-
-// TODO: use borrowed rather than owned parameters
-// when https://github.com/rust-lang/rust/issues/100013 is resolved
 async fn persist<FE: FileSave>(path: Arc<PathBuf>, file: FE) -> Result<u64> {
-    persist_with(path, file, false).await
+    persist_with(path, &file, false).await
 }
 
-async fn persist_with<FE: FileSave>(path: Arc<PathBuf>, file: FE, durable: bool) -> Result<u64> {
+async fn persist_with<FE: FileSave>(path: Arc<PathBuf>, file: &FE, durable: bool) -> Result<u64> {
     let tmp = if let Some(ext) = path.extension().and_then(|ext| ext.to_str()) {
         path.with_extension(format!("{}_{}", ext, TMP))
     } else {
@@ -1280,6 +1237,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reopened_file_can_be_evicted_for_durable_replacement() -> crate::Result<()> {
+        let path = unique_tmp_dir();
+        fs::create_dir(&path).await?;
+        fs::write(path.join("data"), b"before").await?;
+        let cache = crate::Cache::<Data>::new(8, None, 0, std::time::Duration::from_secs(1));
+        let root = cache.load(path.clone())?;
+        let file = root.read().await.get_file("data").unwrap().clone();
+        assert_eq!(file.read::<Data>().await?.bytes, b"before");
+
+        // The old contents and replacement exceed capacity together. The
+        // reopened file must participate in eviction to admit the replacement.
+        file.replace_all(Data::new(b"next"), 4).await?;
+        assert_eq!(file.read::<Data>().await?.bytes, b"next");
+        assert_eq!(fs::read(path.join("data")).await?, b"next");
+        fs::remove_dir_all(path).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn durable_replacement_excludes_eviction_and_fails_closed() -> crate::Result<()> {
         for failure in 0..3 {
             let path = unique_tmp_dir();
@@ -1306,6 +1282,7 @@ mod tests {
                     async move { file.replace_all(replacement, 3).await }
                 });
                 started.notified().await;
+                assert_eq!(Arc::strong_count(&started), 2);
                 assert!(file.clone().evict().is_none());
                 task.abort();
                 assert!(task.await.unwrap_err().is_cancelled());

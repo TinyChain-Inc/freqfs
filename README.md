@@ -47,3 +47,15 @@ They are syscall-failure tests, not simulated power-loss tests.
 Memory-mapped file I/O support is deferred planning described in `ROADMAP.md`.
 Any implementation must satisfy this repository's atomicity, backpressure,
 portability, and performance gates.
+
+## Filesystem codecs
+
+File entries implement `freqfs::FileLoad` and `FileSave`. Loads reconstruct the
+same entry type that saves write; typed access validates the resulting entry via
+`AsType`. Adapters must preserve payload identity across persistence rather than
+reinterpret bytes as whichever type a reader requests.
+
+Codec selection belongs entirely to the calling code. freqfs has no `stream`
+feature, codec dependencies, or blanket `FileLoad`/`FileSave` implementations.
+Implement these traits explicitly for the entry type, streaming bytes through
+the codec you choose. Tests and examples demonstrate caller-owned TBON adapters.
