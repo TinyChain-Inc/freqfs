@@ -32,6 +32,12 @@ reopening through a new cache; it does not promise rollback. Synchronization err
 unsupported directory barriers. These are per-file durability primitives, not a
 transaction protocol or a multi-file recovery guarantee.
 
+Filename extensions `_freqfs` and extensions ending in `__freqfs` are reserved
+for replacement temporaries. Loading hides abandoned replacements from the
+logical directory and retains them as pending deletions. Coordinated cleanup
+uses the existing writeback or `sync_deleted()` path; loading itself deletes
+nothing and never treats a temporary file as the publication record.
+
 Run `cargo test --all-targets --all-features` for the cache and durability tests.
 On Linux, compile the unit tests with `cargo test --lib --all-features --no-run`
 and use the printed test executable to check syscall failures:

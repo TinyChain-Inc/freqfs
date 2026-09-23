@@ -205,6 +205,12 @@ impl<FE: Send + Sync> Dir<FE> {
     where
         FE: From<F>,
     {
+        if temporary_name(&name) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "reserved filesystem temporary name",
+            ));
+        }
         if self.deleted.remove(&name).is_some() {
             #[cfg(feature = "logging")]
             log::debug!("re-creating deleted file {} in {:?}", name, self.path);
@@ -405,6 +411,12 @@ impl<FE: Send + Sync> Dir<FE> {
     where
         FE: From<F>,
     {
+        if temporary_name(&name) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "reserved filesystem temporary name",
+            ));
+        }
         if self.deleted.remove(&name).is_some() {
             #[cfg(feature = "logging")]
             log::debug!("re-creating deleted file {} in {:?}", name, self.path);
@@ -494,6 +506,12 @@ impl<FE: Send + Sync> Dir<FE> {
     where
         FE: Clone,
     {
+        if temporary_name(&name) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "reserved filesystem temporary name",
+            ));
+        }
         if let Some(file) = self.get_file(&name) {
             file.overwrite(source).await?; // this will update the size in the cache
             Ok(file.clone())
@@ -742,6 +760,7 @@ impl<FE: Send + Sync> DirLock<FE> {
         log::trace!("load cached dir at {}", path.display());
 
         let mut contents = OrdHashMap::new();
+        let mut abandoned = OrdHashMap::new();
         // freqfs is the filesystem owner: this is the one-time canonical scan
         // which constructs the cache before its handles are published.
         let handles = std::fs::read_dir(&path)?;
@@ -765,6 +784,13 @@ impl<FE: Send + Sync> DirLock<FE> {
                 let subdirectory = Self::load(cache.clone(), handle.path())?;
                 contents.insert(name, DirEntry::Dir(subdirectory));
             } else if meta.is_file() {
+                if temporary_name(&name) {
+                    abandoned.insert(
+                        name,
+                        DirEntry::File(FileLock::abandoned(cache.clone(), handle.path())),
+                    );
+                    continue;
+                }
                 let file = FileLock::load(cache.clone(), handle.path());
                 cache.insert(handle.path(), file.clone(), 0);
                 contents.insert(name, DirEntry::File(file));
@@ -777,7 +803,7 @@ impl<FE: Send + Sync> DirLock<FE> {
             path,
             cache,
             contents,
-            deleted: OrdHashMap::new(),
+            deleted: abandoned,
         };
 
         let inner = Arc::new(RwLock::new(dir));
