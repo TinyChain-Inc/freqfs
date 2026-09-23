@@ -17,6 +17,14 @@ use super::Result;
 
 const TMP: &str = "_freqfs";
 
+pub(crate) fn temporary_name(name: &str) -> bool {
+    Path::new(name)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .and_then(|ext| ext.strip_suffix(TMP))
+        .is_some_and(|prefix| prefix.is_empty() || prefix.ends_with('_'))
+}
+
 fn interrupted() -> io::Error {
     io::Error::other("interrupted durable replacement; reopen the cache")
 }
@@ -244,6 +252,15 @@ impl<FE> Clone for FileLock<FE> {
 }
 
 impl<FE> FileLock<FE> {
+    pub(crate) fn abandoned(cache: Arc<Cache<FE>>, path: PathBuf) -> Self {
+        Self {
+            cache,
+            path: Arc::new(path),
+            state: Arc::new(RwLock::new(FileLockState::Deleted(true))),
+            contents: Arc::new(RwLock::new(None)),
+        }
+    }
+
     async fn load_reserved(&self) -> Result<(usize, FE, crate::cache::Reservation<FE>)>
     where
         FE: FileLoad,
@@ -1124,6 +1141,28 @@ mod tests {
         *file.write::<Data>().await? = Data::new(b"new");
         file.clone().evict().unwrap().1.await?;
         assert_eq!(fs::read(path.join("data")).await?, b"new");
+        fs::remove_dir_all(path).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reopening_defers_abandoned_replacement_cleanup() -> crate::Result<()> {
+        let path = unique_tmp_dir();
+        fs::create_dir_all(&path).await?;
+        fs::write(path.join("data"), b"old").await?;
+        fs::write(path.join("data._freqfs"), b"incomplete").await?;
+        let cache = crate::Cache::<Data>::new(4096, None, 0, std::time::Duration::from_secs(3));
+        let dir = cache.load(path.clone())?;
+        assert_eq!(dir.read().await.len(), 1);
+        assert!(path.join("data._freqfs").exists());
+        assert!(dir
+            .write()
+            .await
+            .create_empty_file("reserved._freqfs".into(), Data::new(b"bad"))
+            .is_err());
+        dir.sync_deleted().await?;
+        assert!(!path.join("data._freqfs").exists());
+        assert_eq!(fs::read(path.join("data")).await?, b"old");
         fs::remove_dir_all(path).await?;
         Ok(())
     }
