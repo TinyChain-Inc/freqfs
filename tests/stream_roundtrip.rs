@@ -43,7 +43,21 @@ async fn stream_roundtrip_u64() -> std::io::Result<()> {
 #[derive(Debug, PartialEq)]
 struct FileValue(u64);
 
+impl get_size::GetSize for FileValue {
+    fn get_size(&self) -> usize {
+        8
+    }
+}
+
 impl freqfs::FileLoad for FileValue {
+    async fn load_size(
+        _: &std::path::Path,
+        _: &mut tokio::fs::File,
+        _: &std::fs::Metadata,
+    ) -> std::io::Result<usize> {
+        Ok(8)
+    }
+
     async fn load(
         _: &std::path::Path,
         file: tokio::fs::File,
@@ -55,6 +69,7 @@ impl freqfs::FileLoad for FileValue {
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
 }
+
 impl freqfs::FileSave for FileValue {
     async fn save(&self, file: &mut tokio::fs::File) -> std::io::Result<u64> {
         use futures::TryStreamExt;

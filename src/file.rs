@@ -1,15 +1,17 @@
-use futures::{join, Future, TryFutureExt};
-use safecast::AsType;
-use std::convert::TryInto;
+use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{fmt, io};
+
+use futures::{Future, TryFutureExt};
+use get_size::GetSize;
+use safecast::AsType;
 use tokio::fs;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{
-    OwnedRwLockMappedWriteGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, OwnedSemaphorePermit,
-    RwLock, RwLockMappedWriteGuard, RwLockReadGuard, RwLockWriteGuard,
+    OwnedRwLockReadGuard, OwnedRwLockWriteGuard, OwnedSemaphorePermit, RwLock, RwLockReadGuard,
+    RwLockWriteGuard,
 };
 
 use super::cache::Cache;
@@ -26,7 +28,7 @@ pub(crate) fn temporary_name(name: &str) -> bool {
 }
 
 fn interrupted() -> io::Error {
-    io::Error::other("interrupted durable replacement; reopen the cache")
+    io::Error::other("file ownership invalidated; reopen the cache")
 }
 
 pub(crate) async fn sync_directory(path: &Path) -> Result<()> {
@@ -40,17 +42,86 @@ pub struct FileReadGuard<'a, F> {
 
 pub struct FileReadGuardOwned<FE, F> {
     guard: OwnedRwLockReadGuard<Option<FE>, F>,
+    _cache: Arc<Cache<FE>>,
     _permit: OwnedSemaphorePermit,
 }
 
-pub struct FileWriteGuard<'a, F> {
-    guard: RwLockMappedWriteGuard<'a, F>,
+/// An admitted mutable payload. Dropping the guard reconciles retained allocation.
+/// Exceeding the admitted bound invalidates the file rather than publishing unaccounted data.
+pub struct FileWriteGuard<'a, FE: GetSize, F> {
+    guard: RwLockWriteGuard<'a, Option<FE>>,
+    state: RwLockWriteGuard<'a, FileLockState>,
+    cache: Arc<Cache<FE>>,
+    bound: usize,
+    _payload: PhantomData<F>,
     _permit: OwnedSemaphorePermit,
 }
 
-pub struct FileWriteGuardOwned<FE, F> {
-    guard: OwnedRwLockMappedWriteGuard<Option<FE>, F>,
+pub struct FileWriteGuardOwned<FE: GetSize, F> {
+    guard: OwnedRwLockWriteGuard<Option<FE>>,
+    state: OwnedRwLockWriteGuard<FileLockState>,
+    cache: Arc<Cache<FE>>,
+    bound: usize,
+    _payload: PhantomData<F>,
     _permit: OwnedSemaphorePermit,
+}
+
+impl<FE: GetSize, F> FileWriteGuard<'_, FE, F> {
+    /// Admit a larger retained allocation before growing the payload.
+    pub async fn reserve(&mut self, retained_bound: usize) -> Result<()> {
+        reserve_write(&self.cache, &mut self.bound, retained_bound).await
+    }
+}
+
+impl<FE: GetSize, F> FileWriteGuardOwned<FE, F> {
+    /// Admit a larger retained allocation before growing the payload.
+    pub async fn reserve(&mut self, retained_bound: usize) -> Result<()> {
+        reserve_write(&self.cache, &mut self.bound, retained_bound).await
+    }
+}
+
+async fn reserve_write<FE>(
+    cache: &Arc<Cache<FE>>,
+    bound: &mut usize,
+    retained_bound: usize,
+) -> Result<()> {
+    if retained_bound > *bound {
+        cache.validate_bound(retained_bound)?;
+        cache.reserve(retained_bound - *bound).await?.commit();
+        *bound = retained_bound;
+    }
+
+    Ok(())
+}
+
+fn finish_write<FE: GetSize>(
+    contents: &mut Option<FE>,
+    state: &mut FileLockState,
+    cache: &Cache<FE>,
+    bound: usize,
+) {
+    let actual = contents.as_ref().expect("file").get_size();
+
+    if actual > bound {
+        *state = FileLockState::Failed;
+        *contents = None;
+        cache.release(bound);
+    } else {
+        *state = FileLockState::Modified(actual);
+        cache.release(bound - actual);
+    }
+}
+
+impl<FE: GetSize, F> Drop for FileWriteGuard<'_, FE, F> {
+    fn drop(&mut self) {
+        finish_write(&mut self.guard, &mut self.state, &self.cache, self.bound);
+    }
+}
+
+impl<FE: GetSize, F> Drop for FileWriteGuardOwned<FE, F> {
+    fn drop(&mut self) {
+        finish_write(&mut self.guard, &mut self.state, &self.cache, self.bound);
+    }
 }
 
 impl<'a, F> Deref for FileReadGuard<'a, F> {
@@ -69,31 +140,47 @@ impl<FE, F> Deref for FileReadGuardOwned<FE, F> {
     }
 }
 
-impl<'a, F> Deref for FileWriteGuard<'a, F> {
+impl<FE: GetSize + AsType<F>, F> Deref for FileWriteGuard<'_, FE, F> {
     type Target = F;
 
-    fn deref(&self) -> &Self::Target {
-        &self.guard
+    fn deref(&self) -> &F {
+        self.guard
+            .as_ref()
+            .expect("file")
+            .as_type()
+            .expect("validated payload type")
     }
 }
 
-impl<'a, F> DerefMut for FileWriteGuard<'a, F> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.guard
+impl<FE: GetSize + AsType<F>, F> DerefMut for FileWriteGuard<'_, FE, F> {
+    fn deref_mut(&mut self) -> &mut F {
+        self.guard
+            .as_mut()
+            .expect("file")
+            .as_type_mut()
+            .expect("validated payload type")
     }
 }
 
-impl<FE, F> Deref for FileWriteGuardOwned<FE, F> {
+impl<FE: GetSize + AsType<F>, F> Deref for FileWriteGuardOwned<FE, F> {
     type Target = F;
 
-    fn deref(&self) -> &Self::Target {
-        &self.guard
+    fn deref(&self) -> &F {
+        self.guard
+            .as_ref()
+            .expect("file")
+            .as_type()
+            .expect("validated payload type")
     }
 }
 
-impl<FE, F> DerefMut for FileWriteGuardOwned<FE, F> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.guard
+impl<FE: GetSize + AsType<F>, F> DerefMut for FileWriteGuardOwned<FE, F> {
+    fn deref_mut(&mut self) -> &mut F {
+        self.guard
+            .as_mut()
+            .expect("file")
+            .as_type_mut()
+            .expect("validated payload type")
     }
 }
 
@@ -109,13 +196,13 @@ impl<FE, F: fmt::Debug> fmt::Debug for FileReadGuardOwned<FE, F> {
     }
 }
 
-impl<F: fmt::Debug> fmt::Debug for FileWriteGuard<'_, F> {
+impl<FE: GetSize + AsType<F>, F: fmt::Debug> fmt::Debug for FileWriteGuard<'_, FE, F> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&**self, formatter)
     }
 }
 
-impl<FE, F: fmt::Debug> fmt::Debug for FileWriteGuardOwned<FE, F> {
+impl<FE: GetSize + AsType<F>, F: fmt::Debug> fmt::Debug for FileWriteGuardOwned<FE, F> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&**self, formatter)
     }
@@ -162,7 +249,7 @@ impl<FE, F> FileDeref for Arc<FileReadGuardOwned<FE, F>> {
     }
 }
 
-impl<'a, F> FileDeref for FileWriteGuard<'a, F> {
+impl<FE: GetSize + AsType<F>, F> FileDeref for FileWriteGuard<'_, FE, F> {
     type File = F;
 
     fn as_file(&self) -> &F {
@@ -170,7 +257,7 @@ impl<'a, F> FileDeref for FileWriteGuard<'a, F> {
     }
 }
 
-impl<FE, F> FileDeref for FileWriteGuardOwned<FE, F> {
+impl<FE: GetSize + AsType<F>, F> FileDeref for FileWriteGuardOwned<FE, F> {
     type File = F;
 
     fn as_file(&self) -> &F {
@@ -180,7 +267,16 @@ impl<FE, F> FileDeref for FileWriteGuardOwned<FE, F> {
 
 /// Load a file-backed data structure.
 #[trait_variant::make(Send)]
-pub trait FileLoad: Send + Sync + Sized + 'static {
+pub trait FileLoad: GetSize + Send + Sync + Sized + 'static {
+    /// Inspect the encoded file using bounded scratch and return an upper bound on
+    /// the decoded payload's retained allocation. No payload allocation is admitted yet.
+    /// The file is rewound before `load`; serialized length is not retained size.
+    async fn load_size(
+        path: &Path,
+        file: &mut fs::File,
+        metadata: &std::fs::Metadata,
+    ) -> Result<usize>;
+
     /// Load this state from the given `file`.
     async fn load(path: &Path, file: fs::File, metadata: std::fs::Metadata) -> Result<Self>;
 }
@@ -214,21 +310,8 @@ impl FileLockState {
         matches!(self, Self::Deleted(_))
     }
 
-    fn is_loaded(&self) -> bool {
-        matches!(self, Self::Read(_) | Self::Modified(_))
-    }
-
     fn is_pending(&self) -> bool {
         matches!(self, Self::Pending)
-    }
-
-    fn upgrade(&mut self) {
-        let size = match self {
-            Self::Read(size) | Self::Modified(size) => *size,
-            _ => unreachable!("upgrade a file not in the cache"),
-        };
-
-        *self = Self::Modified(size);
     }
 }
 
@@ -238,6 +321,24 @@ pub struct FileLock<FE> {
     path: Arc<PathBuf>,
     state: Arc<RwLock<FileLockState>>,
     contents: Arc<RwLock<Option<FE>>>,
+}
+
+// Cache entries retain file state, but never the Cache that owns the entry.
+pub(crate) struct CachedFile<FE> {
+    path: Arc<PathBuf>,
+    state: Arc<RwLock<FileLockState>>,
+    contents: Arc<RwLock<Option<FE>>>,
+}
+
+impl<FE> CachedFile<FE> {
+    pub(crate) fn with_cache(&self, cache: Arc<Cache<FE>>) -> FileLock<FE> {
+        FileLock {
+            cache,
+            path: self.path.clone(),
+            state: self.state.clone(),
+            contents: self.contents.clone(),
+        }
+    }
 }
 
 impl<FE> Clone for FileLock<FE> {
@@ -252,6 +353,14 @@ impl<FE> Clone for FileLock<FE> {
 }
 
 impl<FE> FileLock<FE> {
+    pub(crate) fn cached(&self) -> CachedFile<FE> {
+        CachedFile {
+            path: self.path.clone(),
+            state: self.state.clone(),
+            contents: self.contents.clone(),
+        }
+    }
+
     pub(crate) fn abandoned(cache: Arc<Cache<FE>>, path: PathBuf) -> Self {
         Self {
             cache,
@@ -265,14 +374,19 @@ impl<FE> FileLock<FE> {
     where
         FE: FileLoad,
     {
-        let (file, metadata, size) = open(&self.path, self.cache.capacity()).await?;
-        let reservation = self.cache.reserve(size).await?;
+        let (mut file, metadata) = open(&self.path).await?;
+        let bound = FE::load_size(&self.path, &mut file, &metadata).await?;
+        let mut reservation = self.cache.reserve(bound).await?;
+        file.rewind().await?;
         let entry = FE::load(&self.path, file, metadata).await?;
-        Ok((size, entry, reservation))
+        let actual = entry.get_size();
+        validate_size(actual, bound)?;
+        reservation.shrink(actual);
+        Ok((actual, entry, reservation))
     }
 
     /// Create a new [`FileLock`].
-    pub fn new<F>(cache: Arc<Cache<FE>>, path: PathBuf, contents: F, size: usize) -> Self
+    pub(crate) fn new<F>(cache: Arc<Cache<FE>>, path: PathBuf, contents: F, size: usize) -> Self
     where
         FE: From<F>,
     {
@@ -290,7 +404,7 @@ impl<FE> FileLock<FE> {
     }
 
     /// Load a new [`FileLock`].
-    pub fn load<F>(cache: Arc<Cache<FE>>, path: PathBuf) -> Self
+    pub(crate) fn load<F>(cache: Arc<Cache<FE>>, path: PathBuf) -> Self
     where
         FE: From<F>,
     {
@@ -302,68 +416,56 @@ impl<FE> FileLock<FE> {
         }
     }
 
-    /// Replace the contents of this [`FileLock`] with those of the `other` [`FileLock`],
-    /// without reading from the filesystem.
+    /// Replace this file from another cached payload or its persisted contents.
     pub async fn overwrite(&self, other: &Self) -> Result<()>
     where
-        FE: Clone,
+        FE: GetSize + Clone,
     {
-        let (mut this, that) = join!(self.state.write(), other.state.read());
-
-        if matches!(*this, FileLockState::Failed) || matches!(*that, FileLockState::Failed) {
-            return Err(interrupted());
+        if Arc::ptr_eq(&self.state, &other.state) {
+            return Ok(());
         }
-        let old_size = match &*this {
-            FileLockState::Pending | FileLockState::Deleted(_) => 0,
-            FileLockState::Failed => return Err(interrupted()),
-            FileLockState::Read(size) | FileLockState::Modified(size) => *size,
+        let _permit = self.cache.acquire_file_handle().await?;
+        // Reciprocal copies acquire the same first state lock. The Arc keeps
+        // its identity stable for the entire acquisition and copy.
+        let (mut this, that) = if Arc::as_ptr(&self.state) < Arc::as_ptr(&other.state) {
+            let this = self.state.write().await;
+            let that = other.state.read().await;
+            (this, that)
+        } else {
+            let that = other.state.read().await;
+            let this = self.state.write().await;
+            (this, that)
         };
-
-        let new_size = match &*that {
-            FileLockState::Failed => return Err(interrupted()),
+        this.check_available()?;
+        that.check_available()?;
+        let old_size = match *this {
+            FileLockState::Read(size) | FileLockState::Modified(size) => size,
+            _ => 0,
+        };
+        let mut contents = self.contents.write().await;
+        match *that {
             FileLockState::Pending => {
-                debug_assert!(other.path.exists());
-
                 create_dir(self.path.parent().expect("file parent dir")).await?;
-
-                match fs::copy(other.path.as_path(), self.path.as_path()).await {
-                    Ok(_) => {}
-                    Err(cause) if cause.kind() == io::ErrorKind::NotFound => {
-                        #[cfg(debug_assertions)]
-                        let message = format!(
-                            "tried to copy a file from a nonexistent source: {}",
-                            other.path.display()
-                        );
-
-                        #[cfg(not(debug_assertions))]
-                        let message = "tried to copy a file from a nonexistent source";
-
-                        return Err(io::Error::new(io::ErrorKind::NotFound, message));
-                    }
-                    Err(cause) => return Err(cause),
-                }
-
+                fs::copy(other.path.as_path(), self.path.as_path()).await?;
+                *contents = None;
                 *this = FileLockState::Pending;
-                0
-            }
-            FileLockState::Deleted(_sync) => {
-                *this = FileLockState::Deleted(true);
-                0
+                self.cache.release(old_size);
             }
             FileLockState::Read(size) | FileLockState::Modified(size) => {
-                *this = FileLockState::Modified(*size);
-                *size
+                // Cloning retains the old destination until the clone succeeds.
+                // Admit that temporary allocation in full before invoking Clone.
+                let reservation = self.cache.reserve(size).await?;
+                let source = other.contents.read().await;
+                let value = source.as_ref().expect("file").clone();
+                let actual = value.get_size();
+                validate_size(actual, size)?;
+                *contents = Some(value);
+                *this = FileLockState::Modified(actual);
+                reservation.commit();
+                self.cache.release(old_size + size - actual);
             }
-        };
-
-        if this.is_loaded() {
-            let (mut this_data, that_data) = join!(self.contents.write(), other.contents.read());
-            let that_data = that_data.as_ref().expect("file");
-            *this_data = Some(FE::clone(that_data));
+            _ => unreachable!("validated source state"),
         }
-
-        self.cache.resize(old_size, new_size).await?;
-
         Ok(())
     }
 
@@ -390,7 +492,13 @@ impl<FE> FileLock<FE> {
             contents.downgrade()
         } else {
             self.cache.bump(&self.path, None);
-            self.contents.read().await
+            // Do not cooperatively suspend a cached read while retaining the
+            // exclusive state guard: another consumer may drive the next read
+            // before polling this buffered future again.
+            match self.contents.try_read() {
+                Ok(contents) => contents,
+                Err(_) => self.contents.read().await,
+            }
         };
 
         read_type(guard).map(|guard| FileReadGuard {
@@ -451,11 +559,15 @@ impl<FE> FileLock<FE> {
             contents.downgrade()
         } else {
             self.cache.bump(&self.path, None);
-            self.contents.clone().read_owned().await
+            match self.contents.clone().try_read_owned() {
+                Ok(contents) => contents,
+                Err(_) => self.contents.clone().read_owned().await,
+            }
         };
 
         read_type_owned(guard).map(|guard| FileReadGuardOwned {
             guard,
+            _cache: Arc::clone(&self.cache),
             _permit: permit,
         })
     }
@@ -483,6 +595,7 @@ impl<FE> FileLock<FE> {
 
                 read_type_owned(guard).map(|guard| FileReadGuardOwned {
                     guard,
+                    _cache: Arc::clone(&self.cache),
                     _permit: permit,
                 })
             }
@@ -516,159 +629,165 @@ impl<FE> FileLock<FE> {
             contents.downgrade()
         } else {
             self.cache.bump(&self.path, None);
-            self.contents.read_owned().await
+            match self.contents.clone().try_read_owned() {
+                Ok(contents) => contents,
+                Err(_) => self.contents.read_owned().await,
+            }
         };
 
         read_type_owned(guard).map(|guard| FileReadGuardOwned {
             guard,
+            _cache: Arc::clone(&self.cache),
             _permit: permit,
         })
     }
 
-    /// Lock this file for writing.
-    pub async fn write<F>(&self) -> Result<FileWriteGuard<'_, F>>
+    /// Admit at least `retained_bound` bytes and lock this file for mutation.
+    /// Existing retained allocation remains admitted; zero permits no additional growth.
+    pub async fn write<F>(&self, retained_bound: usize) -> Result<FileWriteGuard<'_, FE, F>>
     where
         F: Send + Sync + 'static,
         FE: FileLoad + AsType<F> + From<F>,
     {
         let permit = self.cache.acquire_file_handle().await?;
         let mut state = self.state.write().await;
-
         state.check_available()?;
-
-        let guard = if state.is_pending() {
-            let mut contents = self.contents.try_write().expect("file contents");
+        let mut guard = self.contents.write().await;
+        if state.is_pending() {
             let (size, entry, reservation) = self.load_reserved().await?;
+            *guard = Some(entry);
+            *state = FileLockState::Read(size);
             reservation.commit();
-            self.cache.bump(&self.path, None);
+        }
 
-            *state = FileLockState::Modified(size);
-            *contents = Some(entry);
+        let current = check_write::<FE, F>(&guard, &state)?;
+        let retained_bound = retained_bound.max(current);
+        self.cache.validate_bound(retained_bound)?;
+        self.cache.reserve(retained_bound - current).await?.commit();
+        self.cache.bump(&self.path, None);
 
-            contents
-        } else {
-            state.upgrade();
-            self.cache.bump(&self.path, None);
-            self.contents.write().await
-        };
-
-        write_type(guard).map(|guard| FileWriteGuard {
+        Ok(FileWriteGuard {
             guard,
+            state,
+            cache: Arc::clone(&self.cache),
+            bound: retained_bound,
+            _payload: PhantomData,
             _permit: permit,
         })
     }
 
-    /// Lock this file for writing synchronously if possible, otherwise return an error.
-    pub fn try_write<F>(&self) -> Result<FileWriteGuard<'_, F>>
+    /// Admit and lock a cached file immediately, or return an admission/lock error.
+    pub fn try_write<F>(&self, retained_bound: usize) -> Result<FileWriteGuard<'_, FE, F>>
     where
         F: Send + Sync + 'static,
         FE: FileLoad + AsType<F>,
     {
         let permit = self.cache.try_acquire_file_handle()?;
-        let mut state = self.state.try_write().map_err(would_block)?;
-
+        let state = self.state.try_write().map_err(would_block)?;
         state.check_available()?;
-        if state.is_pending() {
-            Err(would_block("this file is not in the cache"))
-        } else {
-            state.upgrade();
-            self.cache.bump(&self.path, None);
-            let guard = self.contents.try_write().map_err(would_block)?;
-            write_type(guard).map(|guard| FileWriteGuard {
-                guard,
-                _permit: permit,
-            })
-        }
+        let guard = self.contents.try_write().map_err(would_block)?;
+
+        let current = check_write::<FE, F>(&guard, &state)?;
+        let retained_bound = retained_bound.max(current);
+        self.cache.validate_bound(retained_bound)?;
+        self.cache.try_reserve(retained_bound - current)?.commit();
+        self.cache.bump(&self.path, None);
+
+        Ok(FileWriteGuard {
+            guard,
+            state,
+            cache: Arc::clone(&self.cache),
+            bound: retained_bound,
+            _payload: PhantomData,
+            _permit: permit,
+        })
     }
 
-    /// Lock this file for writing.
-    pub async fn write_owned<F>(&self) -> Result<FileWriteGuardOwned<FE, F>>
+    /// Admit at least `retained_bound` bytes and lock this file for owned mutation.
+    pub async fn write_owned<F>(&self, retained_bound: usize) -> Result<FileWriteGuardOwned<FE, F>>
     where
         F: Send + Sync + 'static,
         FE: FileLoad + AsType<F> + From<F>,
     {
         let permit = self.cache.acquire_file_handle().await?;
-        let mut state = self.state.write().await;
-
+        let mut state = Arc::clone(&self.state).write_owned().await;
         state.check_available()?;
-
-        let guard = if state.is_pending() {
-            let mut contents = self
-                .contents
-                .clone()
-                .try_write_owned()
-                .expect("file contents");
-
+        let mut guard = Arc::clone(&self.contents).write_owned().await;
+        if state.is_pending() {
             let (size, entry, reservation) = self.load_reserved().await?;
+            *guard = Some(entry);
+            *state = FileLockState::Read(size);
             reservation.commit();
-            self.cache.bump(&self.path, None);
+        }
 
-            *state = FileLockState::Modified(size);
-            *contents = Some(entry);
+        let current = check_write::<FE, F>(&guard, &state)?;
+        let retained_bound = retained_bound.max(current);
+        self.cache.validate_bound(retained_bound)?;
+        self.cache.reserve(retained_bound - current).await?.commit();
+        self.cache.bump(&self.path, None);
 
-            contents
-        } else {
-            state.upgrade();
-            self.cache.bump(&self.path, None);
-            self.contents.clone().write_owned().await
-        };
-
-        write_type_owned(guard).map(|guard| FileWriteGuardOwned {
+        Ok(FileWriteGuardOwned {
             guard,
+            state,
+            cache: Arc::clone(&self.cache),
+            bound: retained_bound,
+            _payload: PhantomData,
             _permit: permit,
         })
     }
 
-    /// Lock this file for writing synchronously if possible, otherwise return an error.
-    pub fn try_write_owned<F>(&self) -> Result<FileWriteGuardOwned<FE, F>>
+    /// Admit and lock a cached file immediately, or return an admission/lock error.
+    pub fn try_write_owned<F>(&self, retained_bound: usize) -> Result<FileWriteGuardOwned<FE, F>>
     where
-        FE: AsType<F>,
+        FE: GetSize + AsType<F>,
     {
         let permit = self.cache.try_acquire_file_handle()?;
-        let mut state = self.state.try_write().map_err(would_block)?;
-
+        let state = Arc::clone(&self.state)
+            .try_write_owned()
+            .map_err(would_block)?;
         state.check_available()?;
-        if state.is_pending() {
-            Err(would_block("this file is not in the cache"))
-        } else {
-            state.upgrade();
-            self.cache.bump(&self.path, None);
+        let guard = Arc::clone(&self.contents)
+            .try_write_owned()
+            .map_err(would_block)?;
 
-            let guard = self
-                .contents
-                .clone()
-                .try_write_owned()
-                .map_err(would_block)?;
+        let current = check_write::<FE, F>(&guard, &state)?;
+        let retained_bound = retained_bound.max(current);
+        self.cache.validate_bound(retained_bound)?;
+        self.cache.try_reserve(retained_bound - current)?.commit();
+        self.cache.bump(&self.path, None);
 
-            write_type_owned(guard).map(|guard| FileWriteGuardOwned {
-                guard,
-                _permit: permit,
-            })
-        }
+        Ok(FileWriteGuardOwned {
+            guard,
+            state,
+            cache: Arc::clone(&self.cache),
+            bound: retained_bound,
+            _payload: PhantomData,
+            _permit: permit,
+        })
     }
 
-    /// Lock this file for writing, without borrowing.
-    pub async fn into_write<F>(self) -> Result<FileWriteGuardOwned<FE, F>>
+    /// Admit and lock this file for mutation without borrowing the file handle.
+    pub async fn into_write<F>(self, retained_bound: usize) -> Result<FileWriteGuardOwned<FE, F>>
     where
         F: Send + Sync + 'static,
         FE: FileLoad + AsType<F> + From<F>,
     {
-        self.write_owned().await
+        self.write_owned(retained_bound).await
     }
 
-    /// Lock this file for writing synchronously, if possible, without borrowing.
-    pub fn try_into_write<F>(self) -> Result<FileWriteGuardOwned<FE, F>>
+    /// Admit and lock this file for mutation immediately without borrowing.
+    pub fn try_into_write<F>(self, retained_bound: usize) -> Result<FileWriteGuardOwned<FE, F>>
     where
         F: Send + Sync + 'static,
         FE: FileLoad + AsType<F>,
     {
-        self.try_write_owned()
+        self.try_write_owned(retained_bound)
     }
 
     /// Write buffered contents to the filesystem without a durability barrier.
     pub async fn sync(&self) -> Result<()>
     where
-        FE: FileSave + Clone,
+        FE: FileSave,
     {
         let mut state = self.state.write().await;
 
@@ -681,14 +800,11 @@ impl<FE> FileLock<FE> {
                 log::trace!("sync modified file {}...", self.path.display());
 
                 let contents = self.contents.read().await;
-                let contents = contents.as_ref().cloned().expect("file");
+                let contents = contents.as_ref().expect("file");
 
-                self.cache
-                    .ensure_disk_capacity(&self.path, *old_size as u64)?;
-                let new_size = persist(self.path.clone(), contents).await?;
-
-                self.cache.resize(*old_size, new_size as usize).await?;
-                FileLockState::Read(new_size as usize)
+                self.cache.ensure_disk_space(&self.path)?;
+                persist_with(self.path.clone(), contents, false).await?;
+                FileLockState::Read(*old_size)
             }
             FileLockState::Deleted(pending_delete) => {
                 if *pending_delete {
@@ -707,14 +823,14 @@ impl<FE> FileLock<FE> {
     /// Make this file's contents and its directory entry durable, including prior eviction.
     pub async fn sync_all(&self) -> Result<()>
     where
-        FE: FileSave + Clone,
+        FE: FileSave,
     {
         self.sync_durable(true).await
     }
 
     pub(crate) async fn sync_durable(&self, parent: bool) -> Result<()>
     where
-        FE: FileSave + Clone,
+        FE: FileSave,
     {
         let _permit = self.cache.acquire_file_handle().await?;
         self.sync().await?;
@@ -742,36 +858,36 @@ impl<FE> FileLock<FE> {
         Ok(())
     }
 
-    /// Atomically publish a durable replacement, admitting `size_hint` cache bytes
-    /// before work (as with directory file creation). Once publication begins,
+    /// Atomically publish a durable replacement, admitting `retained_bound` cache
+    /// bytes before work (as with directory file creation). Once publication begins,
     /// error or cancellation requires reopening; access and eviction fail closed.
     /// Encoding borrows the supplied replacement under exclusive ownership.
-    pub async fn replace_all(&self, value: FE, size_hint: usize) -> Result<()>
+    pub async fn replace_all(&self, value: FE, retained_bound: usize) -> Result<()>
     where
-        FE: FileSave + Clone,
+        FE: FileSave + GetSize,
     {
-        let reservation = self.cache.reserve(size_hint).await?;
+        let actual = value.get_size();
+        validate_size(actual, retained_bound)?;
+        self.cache.validate_bound(retained_bound)?;
         let _permit = self.cache.acquire_file_handle().await?;
-        let old_size = {
-            let mut state = self.state.write().await;
-            let old_size = match *state {
-                FileLockState::Read(size) | FileLockState::Modified(size) => size,
-                FileLockState::Pending => 0,
-                FileLockState::Failed => return Err(interrupted()),
-                FileLockState::Deleted(_) => return Err(deleted()),
-            };
-            let mut contents = self.contents.write().await;
-            self.cache
-                .ensure_disk_capacity(&self.path, size_hint as u64)?;
-            *state = FileLockState::Failed;
-            persist_with(self.path.clone(), &value, true).await?;
-            *contents = Some(value);
-            reservation.commit();
-            *state = FileLockState::Read(size_hint);
-            old_size
+        let mut state = self.state.write().await;
+        state.check_available()?;
+        let old_size = match *state {
+            FileLockState::Read(size) | FileLockState::Modified(size) => size,
+            _ => 0,
         };
-        // Release the replaced allocation outside the file's lock domain.
-        self.cache.resize(old_size, 0).await?;
+        let mut contents = self.contents.write().await;
+        let reservation = self
+            .cache
+            .reserve(retained_bound.saturating_sub(old_size))
+            .await?;
+        self.cache.ensure_disk_space(&self.path)?;
+        *state = FileLockState::Failed;
+        persist_with(self.path.clone(), &value, true).await?;
+        *contents = Some(value);
+        reservation.commit();
+        *state = FileLockState::Read(actual);
+        self.cache.release(old_size.max(retained_bound) - actual);
         Ok(())
     }
 
@@ -786,19 +902,19 @@ impl<FE> FileLock<FE> {
             FileLockState::Deleted(_) => return,
         };
 
+        *self.contents.write().await = None;
         self.cache.remove(&self.path, size);
-
         *file_state = FileLockState::Deleted(file_only);
     }
 
     pub(crate) fn evict(self) -> Option<(usize, impl Future<Output = Result<()>> + Send)>
     where
-        FE: FileSave + Clone + 'static,
+        FE: FileSave + 'static,
     {
         // if this file is in use, don't evict it
         let mut state = self.state.try_write_owned().ok()?;
 
-        let (old_size, contents, modified) = match &*state {
+        let (old_size, mut contents, modified) = match &*state {
             FileLockState::Pending => {
                 // in this case there's nothing to evict
                 return None;
@@ -817,18 +933,20 @@ impl<FE> FileLock<FE> {
 
         let eviction = async move {
             if modified {
-                let contents = contents.as_ref().cloned().expect("file");
-                self.cache
-                    .ensure_disk_capacity(&self.path, old_size as u64)?;
-                persist(self.path.clone(), contents).await?;
+                let contents = contents.as_ref().expect("file");
+                self.cache.ensure_disk_space(&self.path)?;
+                persist_with(self.path.clone(), contents, false).await?;
             }
 
+            *contents = None;
             *state = FileLockState::Pending;
-            drop(state);
+            // Pending readers require exclusive contents access. Release it before
+            // publishing Pending by unlocking state, including to other workers.
             drop(contents);
+            drop(state);
 
-            // Never acquire Cache::state while holding a file or contents guard.
-            self.cache.resize(old_size, 0).await?;
+            // Shrinking accounting cannot suspend. Release native guards first.
+            self.cache.release(old_size);
             Ok(())
         };
 
@@ -848,7 +966,7 @@ impl<FE> fmt::Debug for FileLock<FE> {
     }
 }
 
-async fn open(path: &Path, capacity: usize) -> Result<(fs::File, std::fs::Metadata, usize)> {
+async fn open(path: &Path) -> Result<(fs::File, std::fs::Metadata)> {
     let file = match fs::File::open(path).await {
         Ok(file) => file,
         Err(cause) if cause.kind() == io::ErrorKind::NotFound => {
@@ -864,25 +982,10 @@ async fn open(path: &Path, capacity: usize) -> Result<(fs::File, std::fs::Metada
     };
 
     let metadata = file.metadata().await?;
-    let size = match metadata.len().try_into() {
-        Ok(size) => size,
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::OutOfMemory,
-                "this file is too large to load into the cache",
-            ));
-        }
-    };
-    if size > capacity {
-        return Err(io::Error::new(
-            io::ErrorKind::OutOfMemory,
-            "this file exceeds the configured cache capacity",
-        ));
-    }
-
-    Ok((file, metadata, size))
+    Ok((file, metadata))
 }
 
+#[cfg(test)]
 async fn persist<FE: FileSave>(path: Arc<PathBuf>, file: FE) -> Result<u64> {
     persist_with(path, &file, false).await
 }
@@ -989,37 +1092,27 @@ where
     }
 }
 
-#[inline]
-fn write_type<F, T>(maybe_file: RwLockWriteGuard<Option<F>>) -> Result<RwLockMappedWriteGuard<T>>
-where
-    F: AsType<T>,
-{
-    match RwLockWriteGuard::try_map(maybe_file, |file| {
-        file.as_mut().expect("file").as_type_mut()
-    }) {
-        Ok(file) => Ok(file),
-        Err(_) => Err(invalid_data(format!(
+fn check_write<FE: AsType<F>, F>(contents: &Option<FE>, state: &FileLockState) -> Result<usize> {
+    let current = match state {
+        FileLockState::Read(size) | FileLockState::Modified(size) => *size,
+        _ => return Err(would_block("this file is not in the cache")),
+    };
+    if contents.as_ref().expect("file").as_type().is_none() {
+        return Err(invalid_data(format!(
             "invalid file type, expected {}",
             std::any::type_name::<F>()
-        ))),
+        )));
     }
+    Ok(current)
 }
 
-#[inline]
-fn write_type_owned<F, T>(
-    maybe_file: OwnedRwLockWriteGuard<Option<F>>,
-) -> Result<OwnedRwLockMappedWriteGuard<Option<F>, T>>
-where
-    F: AsType<T>,
-{
-    match OwnedRwLockWriteGuard::try_map(maybe_file, |file| {
-        file.as_mut().expect("file").as_type_mut()
-    }) {
-        Ok(file) => Ok(file),
-        Err(_) => Err(invalid_data(format!(
-            "invalid file type, expected {}",
-            std::any::type_name::<F>()
-        ))),
+pub(crate) fn validate_size(actual: usize, bound: usize) -> Result<()> {
+    if actual > bound {
+        Err(invalid_data(
+            "retained payload exceeds its admitted allocation bound",
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -1057,11 +1150,13 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{persist, FileLoad, FileLockState, FileSave};
     use std::path::PathBuf;
     use std::sync::Arc;
+
     use tokio::fs;
     use tokio::io::AsyncWriteExt;
+
+    use super::{persist, FileLoad, FileLockState, FileSave};
 
     fn unique_tmp_dir() -> PathBuf {
         let mut path = std::env::temp_dir();
@@ -1076,6 +1171,7 @@ mod tests {
         fail: bool,
         unlink: Option<PathBuf>,
     }
+
     impl Data {
         fn new(bytes: &[u8]) -> Self {
             Self {
@@ -1086,29 +1182,53 @@ mod tests {
             }
         }
     }
+
     impl safecast::AsType<Data> for Data {
         fn as_type(&self) -> Option<&Data> {
             Some(self)
         }
+
         fn as_type_mut(&mut self) -> Option<&mut Data> {
             Some(self)
         }
+
         fn into_type(self) -> Option<Data> {
             Some(self)
         }
     }
+
+    impl get_size::GetSize for Data {
+        fn get_size(&self) -> usize {
+            self.bytes.capacity()
+        }
+    }
+
     impl FileLoad for Data {
+        async fn load_size(
+            _: &std::path::Path,
+            _: &mut fs::File,
+            metadata: &std::fs::Metadata,
+        ) -> crate::Result<usize> {
+            usize::try_from(metadata.len()).map_err(std::io::Error::other)
+        }
+
         async fn load(
             _: &std::path::Path,
             mut file: fs::File,
-            _: std::fs::Metadata,
+            metadata: std::fs::Metadata,
         ) -> crate::Result<Self> {
             use tokio::io::AsyncReadExt;
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes).await?;
-            Ok(Self::new(&bytes))
+            let mut bytes = vec![0; metadata.len() as usize];
+            file.read_exact(&mut bytes).await?;
+            Ok(Self {
+                bytes,
+                pause: None,
+                fail: false,
+                unlink: None,
+            })
         }
     }
+
     impl FileSave for Data {
         async fn save(&self, file: &mut fs::File) -> crate::Result<u64> {
             file.write_all(&self.bytes).await?;
@@ -1126,6 +1246,124 @@ mod tests {
         }
     }
 
+    async fn overwrite_files(
+        cached: bool,
+    ) -> crate::Result<(PathBuf, super::FileLock<Data>, super::FileLock<Data>)> {
+        let path = unique_tmp_dir();
+        fs::create_dir(&path).await?;
+        fs::write(path.join("a"), b"one").await?;
+        fs::write(path.join("b"), b"two").await?;
+        let root = crate::Cache::<Data>::new(16, Some(2), 0, std::time::Duration::from_secs(1))
+            .load(path.clone())?;
+        let (a, b) = {
+            let dir = root.read().await;
+            (
+                dir.get_file("a").unwrap().clone(),
+                dir.get_file("b").unwrap().clone(),
+            )
+        };
+        if cached {
+            a.read::<Data>().await?;
+            b.read::<Data>().await?;
+        }
+        let (low, high) = if Arc::as_ptr(&a.state) < Arc::as_ptr(&b.state) {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        Ok((path, low, high))
+    }
+
+    #[tokio::test]
+    async fn reciprocal_overwrites_acquire_states_in_one_order() -> crate::Result<()> {
+        for cached in [false, true] {
+            let (path, low, high) = overwrite_files(cached).await?;
+            {
+                let barrier = low.state.write().await;
+                let reverse = high.overwrite(&low);
+                let forward = low.overwrite(&high);
+                futures::pin_mut!(reverse, forward);
+                assert!(futures::poll!(&mut reverse).is_pending());
+                // A copy waiting on the first state may not hold the second.
+                assert!(high.state.try_write().is_ok());
+                assert!(futures::poll!(&mut forward).is_pending());
+                drop(barrier);
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    futures::try_join!(reverse, forward)
+                })
+                .await
+                .expect("reciprocal copies must complete")?;
+            }
+            let left = low.read::<Data>().await?.bytes.clone();
+            let right = high.read::<Data>().await?.bytes.clone();
+            assert_eq!(left, right);
+            assert!(left == b"one" || left == b"two");
+            drop(low);
+            drop(high);
+            fs::remove_dir_all(path).await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_overwrites_release_states_and_capacity() -> crate::Result<()> {
+        for cached in [false, true] {
+            for reverse in [false, true] {
+                let (path, low, high) = overwrite_files(cached).await?;
+                let barrier = high.state.write().await;
+                {
+                    let copy = if reverse {
+                        high.overwrite(&low)
+                    } else {
+                        low.overwrite(&high)
+                    };
+                    futures::pin_mut!(copy);
+                    assert!(futures::poll!(&mut copy).is_pending());
+                    assert!(low.state.try_write().is_err());
+                }
+                assert!(low.state.try_write().is_ok());
+                drop(barrier);
+                assert!(high.state.try_write().is_ok());
+                // Both handle permits are available after cancellation.
+                let left = low.read::<Data>().await?;
+                let right = high.read::<Data>().await?;
+                assert_ne!(left.bytes, right.bytes);
+                assert_eq!(fs::read(path.join("a")).await?, b"one");
+                assert_eq!(fs::read(path.join("b")).await?, b"two");
+                drop(left);
+                drop(right);
+                drop(low);
+                drop(high);
+                fs::remove_dir_all(path).await?;
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn overwrite_self_needs_no_locks_or_admission() -> crate::Result<()> {
+        for cached in [false, true] {
+            let (path, file, other) = overwrite_files(cached).await?;
+            {
+                let _state = file.state.write().await;
+                let _first = file.cache.acquire_file_handle().await?;
+                let _second = file.cache.acquire_file_handle().await?;
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    file.overwrite(&file.clone()),
+                )
+                .await
+                .expect("self-copy must not acquire capacity or locks")?;
+            }
+            assert_eq!(fs::read(path.join("a")).await?, b"one");
+            assert_eq!(fs::read(path.join("b")).await?, b"two");
+            drop(file);
+            drop(other);
+            fs::remove_dir_all(path).await?;
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn buffered_writeback_and_eviction_have_no_durability_barriers() -> crate::Result<()> {
         let path = unique_tmp_dir();
@@ -1138,9 +1376,63 @@ mod tests {
             .create_file("data".into(), Data::new(b"old"), 3)
             .await?;
         root.sync().await?;
-        *file.write::<Data>().await? = Data::new(b"new");
+        *file.write::<Data>(3).await? = Data::new(b"new");
         file.clone().evict().unwrap().1.await?;
+        assert!(file.contents.try_read().unwrap().is_none());
         assert_eq!(fs::read(path.join("data")).await?, b"new");
+        fs::remove_dir_all(path).await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_readers_observe_released_eviction_contents() -> crate::Result<()> {
+        use futures::FutureExt;
+
+        let path = unique_tmp_dir();
+        fs::create_dir(&path).await?;
+        let cache = crate::Cache::<Data>::new(3, Some(2), 0, std::time::Duration::from_secs(3));
+        let root = cache.load(path.clone())?;
+        let file = root
+            .write()
+            .await
+            .create_file("data".into(), Data::new(b"old"), 3)
+            .await?;
+        file.sync().await?;
+        for _ in 0..256 {
+            let eviction = file.clone().evict().unwrap().1;
+            let reader = file.read::<Data>();
+            futures::pin_mut!(reader);
+            assert!(reader.as_mut().now_or_never().is_none());
+            let eviction = tokio::spawn(eviction);
+            assert_eq!(reader.await?.bytes, b"old");
+            eviction.await.unwrap()?;
+        }
+        // Eviction failure or cancellation retains the resident data and state.
+        for failure in [true, false] {
+            let started = Arc::new(tokio::sync::Notify::new());
+            let mut replacement = Data::new(b"new");
+            replacement.fail = failure;
+            replacement.pause = (!failure).then(|| Arc::clone(&started));
+            *file.write::<Data>(3).await? = replacement;
+            let eviction = file.clone().evict().unwrap().1;
+            if failure {
+                assert!(eviction.await.is_err());
+            } else {
+                let task = tokio::spawn(eviction);
+                started.notified().await;
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+            }
+            assert!(matches!(
+                *file.state.read().await,
+                FileLockState::Modified(3)
+            ));
+            assert_eq!(
+                file.contents.try_read().unwrap().as_ref().unwrap().bytes,
+                b"new"
+            );
+            assert_eq!(file.read::<Data>().await?.bytes, b"new");
+        }
         fs::remove_dir_all(path).await?;
         Ok(())
     }
@@ -1159,6 +1451,7 @@ mod tests {
             .write()
             .await
             .create_empty_file("reserved._freqfs".into(), Data::new(b"bad"))
+            .await
             .is_err());
         dir.sync_deleted().await?;
         assert!(!path.join("data._freqfs").exists());
@@ -1183,13 +1476,14 @@ mod tests {
         assert!(matches!(*file.state.read().await, FileLockState::Pending));
         file.sync_all().await?;
         file.sync_all().await?;
-        *file.write::<Data>().await? = Data::new(b"new");
+        *file.write::<Data>(3).await? = Data::new(b"new");
         file.clone().evict().unwrap().1.await?;
         root.sync_all().await?;
         assert_eq!(fs::read(path.join("data")).await?, b"new");
         root.write().await.delete("data").await;
         root.sync_all().await?;
-        assert!(!path.exists());
+        assert!(path.is_dir());
+        fs::remove_dir_all(path).await?;
         Ok(())
     }
 
@@ -1204,7 +1498,7 @@ mod tests {
             .await
             .create_file("data".into(), Data::new(b"old"), 3)
             .await?;
-        let mut writer = file.write::<Data>().await?;
+        let mut writer = file.write::<Data>(3).await?;
         *writer = Data::new(b"new");
         let mut task = tokio::spawn({
             let file = file.clone();
@@ -1239,7 +1533,7 @@ mod tests {
         root.sync_all().await?;
         root.sync_all().await?;
         let survivor = nested.read().await.get_file("b").unwrap().clone();
-        *survivor.write::<Data>().await? = Data::new(b"next");
+        *survivor.write::<Data>(4).await? = Data::new(b"next");
         nested.write().await.delete("a").await;
         nested.sync_deleted().await?;
         assert!(!path.join("nested/a").exists());
@@ -1253,20 +1547,83 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    #[ignore = "requires strace -e inject=fsync:error=EIO:when=1 or when=2"]
-    async fn durable_replacement_syscall_failure_requires_reopen() -> crate::Result<()> {
+    #[test]
+    fn durable_replacement_syscall_failure_requires_reopen() -> crate::Result<()> {
+        const CHILD: &str = "FREQFS_FSYNC_FAILURE_CHILD";
+        if let Some(position) = std::env::var_os(CHILD) {
+            let position: usize = position
+                .to_str()
+                .expect("UTF-8 child marker")
+                .parse()
+                .expect("numeric child marker");
+            assert!(matches!(position, 1 | 2), "invalid child marker");
+            return tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                // strace counts each syscall separately for each tracee. Keep
+                // both sequential fsyncs on the same blocking worker thread.
+                .max_blocking_threads(1)
+                .build()?
+                .block_on(durable_replacement_failure_probe(position));
+        }
+
+        for position in [1, 2] {
+            let output = std::process::Command::new("strace")
+                .args(["-f", "-y", "-e", "trace=fsync", "-e"])
+                .arg(format!("inject=fsync:error=EIO:when={position}"))
+                .arg(std::env::current_exe()?)
+                .args([
+                    "--exact", "file::tests::durable_replacement_syscall_failure_requires_reopen",
+                    "--nocapture", "--test-threads=1",
+                ])
+                .env(CHILD, position.to_string())
+                .output()
+                .expect("mandatory syscall fault test requires strace and permission to trace child processes");
+            let trace = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "fsync position {position}: {}\n{trace}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            let mut injected = trace
+                .lines()
+                .filter(|line| line.contains("fsync(") && line.contains("(INJECTED)"));
+            let failure = injected
+                .next()
+                .expect("strace must inject an fsync failure");
+            assert!(
+                injected.next().is_none(),
+                "exactly one failure expected: {trace}"
+            );
+            assert!(
+                failure.contains("EIO"),
+                "unexpected injected error: {trace}"
+            );
+            assert!(
+                failure.contains("freqfs_test_file_"),
+                "unexpected fsync target: {trace}"
+            );
+            assert_eq!(
+                failure.contains("._freqfs"),
+                position == 1,
+                "wrong publication phase: {trace}"
+            );
+        }
+        Ok(())
+    }
+
+    async fn durable_replacement_failure_probe(position: usize) -> crate::Result<()> {
         let path = unique_tmp_dir();
         fs::create_dir(&path).await?;
         fs::write(path.join("data"), b"old").await?;
         let cache = crate::Cache::<Data>::new(1024, None, 0, std::time::Duration::from_secs(1));
         let root = cache.load(path.clone())?;
         let file = root.read().await.get_file("data").unwrap().clone();
-        assert!(file.replace_all(Data::new(b"new"), 3).await.is_err());
+        let error = file.replace_all(Data::new(b"new"), 3).await.unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(5), "expected Linux EIO: {error}");
         assert!(file.read::<Data>().await.is_err());
         assert!(file.clone().evict().is_none());
         let contents = fs::read(path.join("data")).await?;
-        assert!(contents == b"old" || contents == b"new");
+        assert_eq!(contents, if position == 1 { b"old" } else { b"new" });
         let reopened = crate::Cache::<Data>::new(1024, None, 0, std::time::Duration::from_secs(1))
             .load(path.clone())?;
         let current = reopened.read().await.get_file("data").unwrap().clone();
@@ -1330,7 +1687,7 @@ mod tests {
             }
             assert!(file.clone().evict().is_none());
             assert!(file.read::<Data>().await.is_err());
-            assert!(file.write::<Data>().await.is_err());
+            assert!(file.write::<Data>(3).await.is_err());
             assert!(file.sync_all().await.is_err());
             assert_eq!(fs::read(path.join("data")).await?, b"old");
             fs::remove_dir_all(path).await?;

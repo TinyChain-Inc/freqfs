@@ -14,16 +14,21 @@ enum File {
 
 impl de::FromStream for File {
     type Context = ();
+
     async fn from_stream<D: de::Decoder>(_: (), decoder: &mut D) -> Result<Self, D::Error> {
         decoder.decode_any(FileVisitor).await
     }
 }
+
 struct FileVisitor;
+
 impl de::Visitor for FileVisitor {
     type Value = File;
+
     fn expecting() -> &'static str {
         "a filesystem entry"
     }
+
     fn visit_string<E: de::Error>(self, value: String) -> Result<File, E> {
         Ok(File::Text(value))
     }
@@ -57,7 +62,19 @@ async fn sync_virtual_empty_hierarchy_then_publish_a_file() -> Result<(), io::Er
     let parent = root.write().await.create_dir("parent".into())?;
     let child = parent.write().await.create_dir("child".into())?;
     root.sync_all().await?;
-    assert!(!path.join("parent").exists());
+    assert!(path.join("parent/child").is_dir());
+    let reopened =
+        Cache::<File>::new(1024, None, 0, std::time::Duration::from_secs(3)).load(path.clone())?;
+    assert!(reopened
+        .read()
+        .await
+        .get_dir("parent")
+        .unwrap()
+        .read()
+        .await
+        .get_dir("child")
+        .is_some());
+    drop(reopened);
 
     child
         .write()
@@ -80,7 +97,7 @@ async fn delete_then_recreate_file_and_dir() -> Result<(), io::Error> {
     {
         let mut dir = root.write().await;
 
-        // keep at least one entry so syncing deletions won't delete the root dir
+        // Keep a sibling to verify deletion isolation.
         dir.create_file("keep.txt".to_string(), "keep".to_string(), 4)
             .await?;
 
@@ -161,7 +178,27 @@ async fn delete_then_recreate_file_and_dir() -> Result<(), io::Error> {
     Ok(())
 }
 
+impl get_size::GetSize for File {
+    fn get_size(&self) -> usize {
+        match self {
+            Self::Text(text) => text.capacity(),
+        }
+    }
+}
+
 impl freqfs::FileLoad for File {
+    async fn load_size(
+        _: &std::path::Path,
+        _: &mut tokio::fs::File,
+        metadata: &std::fs::Metadata,
+    ) -> std::io::Result<usize> {
+        // Test codec strings and byte vectors retain at most geometric Vec capacity.
+        usize::try_from(metadata.len())
+            .ok()
+            .and_then(|len| len.max(8).checked_next_power_of_two())
+            .ok_or_else(|| std::io::Error::other("payload size overflow"))
+    }
+
     async fn load(
         _: &std::path::Path,
         file: tokio::fs::File,
@@ -172,6 +209,7 @@ impl freqfs::FileLoad for File {
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
 }
+
 impl freqfs::FileSave for File {
     async fn save(&self, file: &mut tokio::fs::File) -> std::io::Result<u64> {
         use futures::TryStreamExt;
@@ -184,4 +222,24 @@ impl freqfs::FileSave for File {
         }
         Ok(size)
     }
+}
+
+#[tokio::test]
+async fn empty_root_survives_writeback_and_durable_sync() -> io::Result<()> {
+    let path = setup_tmp_dir().await?;
+    let root =
+        Cache::<File>::new(1024, None, 0, std::time::Duration::from_secs(3)).load(path.clone())?;
+    root.sync().await?;
+    assert!(path.is_dir());
+    root.sync_all().await?;
+    assert!(path.is_dir());
+    let reopened =
+        Cache::<File>::new(1024, None, 0, std::time::Duration::from_secs(3)).load(path.clone())?;
+    assert!(reopened.read().await.is_empty());
+    root.write().await.truncate_and_sync().await?;
+    assert!(
+        !path.exists(),
+        "explicit root truncation still removes the root"
+    );
+    Ok(())
 }
