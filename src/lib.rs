@@ -17,9 +17,9 @@
 //! (not e.g. via [`tokio::fs`] or [`std::fs`] elsewhere).
 //! It may raise an [`std::io::Error`] or panic if this assumption is not valid.
 //!
-//! In the case that your program may not have permission to write to a filesystem entry,
-//! be sure to check the permissions before modifying it.
-//! The background cleanup thread will panic if it attempts an impermissible write operation.
+//! Adapters declare a decoded-allocation bound before loading and report actual retained
+//! allocation through `GetSize`. Mutable guards admit growth before it occurs. Filesystem
+//! errors, including background eviction failures, propagate to callers unchanged.
 
 mod cache;
 mod dir;

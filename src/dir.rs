@@ -1,13 +1,15 @@
-use async_recursion::async_recursion;
-use ds_ext::OrdHashMap;
-use futures::future;
-use futures::stream::{FuturesUnordered, StreamExt};
-use safecast::AsType;
 use std::cmp::Ordering;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{fmt, io};
+
+use async_recursion::async_recursion;
+use ds_ext::OrdHashMap;
+use futures::future;
+use futures::stream::{FuturesUnordered, StreamExt};
+use get_size::GetSize;
+use safecast::AsType;
 use tokio::fs;
 use tokio::sync::{
     OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
@@ -200,27 +202,14 @@ pub struct Dir<FE> {
 }
 
 impl<FE: Send + Sync> Dir<FE> {
-    /// Create a zero-byte cache entry without capacity admission.
-    pub fn create_empty_file<F>(&mut self, name: String, contents: F) -> Result<FileLock<FE>>
+    /// Create an initial entry, awaiting admission of its actual retained allocation.
+    pub async fn create_empty_file<F>(&mut self, name: String, contents: F) -> Result<FileLock<FE>>
     where
-        FE: From<F>,
+        FE: GetSize + From<F>,
     {
-        if temporary_name(&name) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "reserved filesystem temporary name",
-            ));
-        }
-        if self.deleted.remove(&name).is_some() {
-            #[cfg(feature = "logging")]
-            log::debug!("re-creating deleted file {} in {:?}", name, self.path);
-        }
-
-        let path = self.path.join(&name);
-        let lock = FileLock::new(self.cache.clone(), path.clone(), contents, 0);
-        self.contents.insert(name, DirEntry::File(lock.clone()));
-        self.cache.insert(path, lock.clone(), 0);
-        Ok(lock)
+        let contents: FE = contents.into();
+        let size = contents.get_size();
+        self.create_file::<FE>(name, contents, size).await
     }
 
     /// Borrow the [`Path`] of this [`Dir`].
@@ -371,14 +360,18 @@ impl<FE: Send + Sync> Dir<FE> {
 
     /// Convenience method to lock a file for writing.
     /// Returns a "not found" error if the there is no file with the given `name`.
-    pub async fn write_file<Q, F>(&self, name: &Q) -> Result<FileWriteGuard<'_, F>>
+    pub async fn write_file<Q, F>(
+        &self,
+        name: &Q,
+        retained_bound: usize,
+    ) -> Result<FileWriteGuard<'_, FE, F>>
     where
         Q: Name + fmt::Display + ?Sized,
         F: Send + Sync + 'static,
         FE: FileLoad + AsType<F> + From<F>,
     {
         if let Some(file) = self.get_file(name) {
-            file.write().await
+            file.write(retained_bound).await
         } else {
             Err(io::Error::new(io::ErrorKind::NotFound, name.to_string()))
         }
@@ -386,14 +379,18 @@ impl<FE: Send + Sync> Dir<FE> {
 
     /// Convenience method to lock a file for writing.
     /// Returns a "not found" error if the there is no file with the given `name`.
-    pub async fn write_file_owned<Q, F>(&self, name: &Q) -> Result<FileWriteGuardOwned<FE, F>>
+    pub async fn write_file_owned<Q, F>(
+        &self,
+        name: &Q,
+        retained_bound: usize,
+    ) -> Result<FileWriteGuardOwned<FE, F>>
     where
         Q: Name + fmt::Display + ?Sized,
         F: Send + Sync + 'static,
         FE: FileLoad + AsType<F> + From<F>,
     {
         if let Some(file) = self.get_file(name) {
-            file.write_owned().await
+            file.write_owned(retained_bound).await
         } else {
             Err(io::Error::new(io::ErrorKind::NotFound, name.to_string()))
         }
@@ -402,6 +399,8 @@ impl<FE: Send + Sync> Dir<FE> {
 
 impl<FE: Send + Sync> Dir<FE> {
     /// Create a new file in this [`Dir`] with the given `contents`.
+    /// Returns `AlreadyExists` if the name is present. Use the existing file handle
+    /// to replace a payload without changing its identity.
     pub async fn create_file<F>(
         &mut self,
         name: String,
@@ -409,7 +408,7 @@ impl<FE: Send + Sync> Dir<FE> {
         size: usize,
     ) -> Result<FileLock<FE>>
     where
-        FE: From<F>,
+        FE: GetSize + From<F>,
     {
         if temporary_name(&name) {
             return Err(io::Error::new(
@@ -417,17 +416,26 @@ impl<FE: Send + Sync> Dir<FE> {
                 "reserved filesystem temporary name",
             ));
         }
+        if self.contains(&name) {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, name));
+        }
+
+        let contents: FE = contents.into();
+        let actual = contents.get_size();
+        super::file::validate_size(actual, size)?;
+        let mut reservation = self.cache.reserve(size).await?;
+
         if self.deleted.remove(&name).is_some() {
             #[cfg(feature = "logging")]
             log::debug!("re-creating deleted file {} in {:?}", name, self.path);
         }
 
         let path = self.path.join(&name);
-        let reservation = self.cache.reserve(size).await?;
-
-        let lock = FileLock::new(self.cache.clone(), path.clone(), contents, size);
+        reservation.shrink(actual);
+        let lock = FileLock::new::<FE>(self.cache.clone(), path.clone(), contents, actual);
         self.contents.insert(name, DirEntry::File(lock.clone()));
         self.cache.insert_reserved(path, lock.clone(), reservation);
+
         Ok(lock)
     }
 
@@ -438,7 +446,7 @@ impl<FE: Send + Sync> Dir<FE> {
         size: usize,
     ) -> Result<(Uuid, FileLock<FE>)>
     where
-        FE: From<F>,
+        FE: GetSize + From<F>,
     {
         let mut uuid = Uuid::new_v4();
         let mut name = uuid.to_string();
@@ -461,7 +469,7 @@ impl<FE: Send + Sync> Dir<FE> {
         source: &'a DirLock<FE>,
     ) -> Result<DirLock<FE>>
     where
-        FE: Clone,
+        FE: GetSize + Clone,
     {
         if self.contains(&name) {
             return Err(io::Error::new(
@@ -504,7 +512,7 @@ impl<FE: Send + Sync> Dir<FE> {
         source: &FileLock<FE>,
     ) -> Result<FileLock<FE>>
     where
-        FE: Clone,
+        FE: GetSize + Clone,
     {
         if temporary_name(&name) {
             return Err(io::Error::new(
@@ -562,7 +570,7 @@ impl<FE: Send + Sync> Dir<FE> {
     /// Synchronize the contents of this directory with the filesystem.
     pub async fn sync(&mut self) -> Result<()>
     where
-        FE: FileSave + Clone,
+        FE: FileSave,
     {
         self.sync_contents(false).await
     }
@@ -571,7 +579,7 @@ impl<FE: Send + Sync> Dir<FE> {
     /// Child directory publication is synchronized once per containing directory.
     pub async fn sync_all(&mut self) -> Result<()>
     where
-        FE: FileSave + Clone,
+        FE: FileSave,
     {
         self.sync_contents(true).await?;
         // Standalone subtree calls also publish (or remove) this root's entry.
@@ -582,7 +590,7 @@ impl<FE: Send + Sync> Dir<FE> {
     /// synchronizing surviving children. The containing directory is retained.
     pub async fn sync_deleted(&mut self) -> Result<()>
     where
-        FE: FileSave + Clone,
+        FE: FileSave,
     {
         self.write_deletions().await?;
         {
@@ -616,7 +624,7 @@ impl<FE: Send + Sync> Dir<FE> {
 
     async fn write_deletions(&self) -> Result<()>
     where
-        FE: FileSave + Clone,
+        FE: FileSave,
     {
         for entry in self.deleted.values() {
             match entry {
@@ -633,40 +641,33 @@ impl<FE: Send + Sync> Dir<FE> {
     #[async_recursion]
     async fn sync_contents(&mut self, durable: bool) -> Result<()>
     where
-        FE: FileSave + Clone,
+        FE: FileSave,
     {
-        if self.contents.is_empty() {
-            delete_dir(self.path()).await?;
-            self.deleted.clear();
-            Ok(())
-        } else {
-            self.write_deletions().await?;
-
-            for entry in self.contents.values() {
-                match entry {
-                    DirEntry::Dir(dir) => dir.write().await.sync_contents(durable).await?,
-                    DirEntry::File(file) => {
-                        if durable {
-                            file.sync_durable(false).await?;
-                        } else {
-                            file.sync().await?;
-                        }
+        // A declared directory is an entry in its own right, including when empty.
+        // Only explicit deletion removes roots or descendants.
+        {
+            let _permit = self.cache.acquire_file_handle().await?;
+            fs::create_dir_all(&self.path).await?;
+        }
+        self.write_deletions().await?;
+        for entry in self.contents.values() {
+            match entry {
+                DirEntry::Dir(dir) => dir.write().await.sync_contents(durable).await?,
+                DirEntry::File(file) => {
+                    if durable {
+                        file.sync_durable(false).await?;
+                    } else {
+                        file.sync().await?;
                     }
                 }
             }
-
-            if durable {
-                let _permit = self.cache.acquire_file_handle().await?;
-                match sync_directory(&self.path).await {
-                    Ok(()) => {}
-                    // Empty virtual descendants do not materialize their parent.
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error),
-                }
-            }
-            self.deleted.clear();
-            Ok(())
         }
+        if durable {
+            let _permit = self.cache.acquire_file_handle().await?;
+            sync_directory(&self.path).await?;
+        }
+        self.deleted.clear();
+        Ok(())
     }
 
     /// Delete all entries from this [`Dir`].
@@ -873,7 +874,7 @@ impl<FE: Send + Sync> DirLock<FE> {
     /// Synchronize the contents of this directory with the filesystem.
     pub async fn sync(&self) -> Result<()>
     where
-        FE: FileSave + Clone,
+        FE: FileSave,
     {
         let mut dir = self.state.write().await;
         dir.sync().await
@@ -882,7 +883,7 @@ impl<FE: Send + Sync> DirLock<FE> {
     /// Explicit durable synchronization; ordinary `sync` is buffered writeback.
     pub async fn sync_all(&self) -> Result<()>
     where
-        FE: FileSave + Clone,
+        FE: FileSave,
     {
         self.state.write().await.sync_all().await
     }
@@ -890,7 +891,7 @@ impl<FE: Send + Sync> DirLock<FE> {
     /// Durably apply deletions without synchronizing surviving file contents.
     pub async fn sync_deleted(&self) -> Result<()>
     where
-        FE: FileSave + Clone,
+        FE: FileSave,
     {
         self.state.write().await.sync_deleted().await
     }
@@ -963,9 +964,11 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::Name;
     use std::cmp::Ordering;
+
     use uuid::Uuid;
+
+    use super::Name;
 
     #[test]
     fn name_partial_cmp_uuid() {

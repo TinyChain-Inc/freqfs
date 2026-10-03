@@ -5,7 +5,9 @@ Roadmap and planning notes are tracked in `ROADMAP.md`.
 
 `sync()` writes cached changes to the filesystem without forcing durability.
 Dirty eviction uses the same buffered writeback. Neither acknowledges survival
-of power loss.
+of power loss. Directory synchronization preserves existing empty directories and
+materializes declared empty descendants. Only explicit deletion removes them;
+`truncate_and_sync` explicitly removes its root.
 
 `sync_all()` explicitly synchronizes file contents and directory publication,
 including writes already evicted from memory. Directory calls batch publication
@@ -22,9 +24,10 @@ durably synchronizes their containing directory. It retains that directory and
 does not write back or synchronize surviving children. Use this for reclamation
 after the owning durability protocol has published the removal of references.
 
-For publication records, use `FileLock::replace_all(value, size_hint)` instead of a
+For publication records, use `FileLock::replace_all(value, retained_bound)` instead of a
 cached write followed by synchronization. As with file creation, the caller supplies
-the retained size; cache capacity is admitted before publication begins.
+a retained-allocation bound; cache capacity is admitted before publication begins.
+The final cache charge is the value's actual `GetSize`, independent of encoded bytes.
 This operation excludes eviction, synchronizes
 the temporary replacement before rename, and then synchronizes its parent. An
 error or cancellation after publication begins makes that handle unusable until
@@ -39,16 +42,12 @@ uses the existing writeback or `sync_deleted()` path; loading itself deletes
 nothing and never treats a temporary file as the publication record.
 
 Run `cargo test --all-targets --all-features` for the cache and durability tests.
-On Linux, compile the unit tests with `cargo test --lib --all-features --no-run`
-and use the printed test executable to check syscall failures:
-
-```sh
-strace -f -e inject=fsync:error=EIO:when=1 TEST_EXECUTABLE durable_replacement_syscall_failure_requires_reopen --ignored
-strace -f -e inject=fsync:error=EIO:when=2 TEST_EXECUTABLE durable_replacement_syscall_failure_requires_reopen --ignored
-```
-
-These exercise failure before rename and failure to durably publish the rename.
-They are syscall-failure tests, not simulated power-loss tests.
+The syscall-failure test requires Linux, `strace` with syscall injection support,
+and permission to trace child processes. The ordinary test driver runs the
+replacement probe under injected `fsync` failures at the temporary-file and
+parent-directory barriers, verifies the actual syscall trace, and fails if any
+prerequisite is unavailable. These are syscall-failure tests, not simulated
+power-loss tests.
 
 Memory-mapped file I/O support is deferred planning described in `ROADMAP.md`.
 Any implementation must satisfy this repository's atomicity, backpressure,
@@ -65,3 +64,35 @@ Codec selection belongs entirely to the calling code. freqfs has no `stream`
 feature, codec dependencies, or blanket `FileLoad`/`FileSave` implementations.
 Implement these traits explicitly for the entry type, streaming bytes through
 the codec you choose. Tests and examples demonstrate caller-owned TBON adapters.
+
+## Retained allocation and admission
+
+`FileLoad::load_size` inspects encoded data with bounded scratch and reports an upper
+bound for the decoded allocation before `load` runs. The cache reserves this bound,
+rewinds the file, decodes, validates `GetSize`, and immediately refunds unused
+capacity. `FileSave` reports bytes written; those bytes never replace the cache's
+retained-memory charge. Adapters own both codec-specific size inspection and actual
+capacity accounting, including spare capacity in vectors and other containers.
+
+The configured minimum free-disk threshold checks current filesystem free space
+before writeback. It is separate from retained-memory admission and neither
+estimates encoded size nor reserves space for future writes. Native write errors
+propagate to the caller.
+
+Mutable file methods take a retained bound. The existing allocation remains
+admitted, so `write(0)` permits mutation without growth. A write guard's
+`reserve(bound)` admits additional capacity before the caller allocates it. Guard
+drop reconciles the actual charge. A payload exceeding the admitted bound invalidates
+the file and is discarded; later operations fail until caller-coordinated reopening.
+Creation and replacement likewise validate supplied bounds. Creation requires an
+absent name and returns `AlreadyExists` without changing existing handles; mutate
+or replace an existing payload through its file handle. `Dir::create_empty_file`
+derives the actual retained size and uses the same asynchronous admission,
+awaiting reclaimable cache space before publishing the entry. Cancellation before
+admission publishes no entry; unavailable pinned capacity still returns a bounded
+admission error.
+
+The eviction worker keeps a weak cache reference while idle. Cache entries retain
+payload state without retaining their owning cache; owned guards keep the cache
+alive for exactly their lifetime. Eviction failures retain the original I/O error
+kind and message for the next admission attempt.

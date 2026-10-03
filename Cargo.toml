@@ -23,6 +23,7 @@ logging = ["log"]
 async-recursion = "1.1"
 ds-ext = { path = "../ds-ext", version = "0.4" }
 futures = "0.3"
+get-size = "0.1"
 fs2 = "0.4"
 hr-id = { path = "../hr-id", version = "0.7.0", optional = true }
 log = { version = "0.4", optional = true }

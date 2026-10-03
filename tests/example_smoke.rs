@@ -18,19 +18,25 @@ enum File {
 
 impl de::FromStream for File {
     type Context = ();
+
     async fn from_stream<D: de::Decoder>(_: (), decoder: &mut D) -> Result<Self, D::Error> {
         decoder.decode_any(FileVisitor).await
     }
 }
+
 struct FileVisitor;
+
 impl de::Visitor for FileVisitor {
     type Value = File;
+
     fn expecting() -> &'static str {
         "a filesystem entry"
     }
+
     fn visit_string<E: de::Error>(self, value: String) -> Result<File, E> {
         Ok(File::Text(value))
     }
+
     async fn visit_seq<A: de::SeqAccess>(self, mut seq: A) -> Result<File, A::Error> {
         let mut bytes = Vec::new();
         while let Some(byte) = seq.next_element::<u8>(()).await? {
@@ -88,7 +94,7 @@ async fn run_example(cache: DirLock<File>) -> Result<(), io::Error> {
         let text_file = root.get_file("hello.txt").expect("text file");
 
         {
-            let mut contents: FileWriteGuard<String> = text_file.write().await?;
+            let mut contents: FileWriteGuard<File, String> = text_file.write(64).await?;
             assert_eq!(&*contents, "Hello, world!");
             *contents = "नमस्ते दुनिया!".to_string();
         }
@@ -152,12 +158,33 @@ async fn example_smoke() -> Result<(), io::Error> {
     sub_dir_path.push("subdir");
     assert!(!sub_dir_path.exists());
 
-    assert!(!path.exists());
-
+    assert!(path.is_dir());
+    fs::remove_dir_all(path).await?;
     Ok(())
 }
 
+impl get_size::GetSize for File {
+    fn get_size(&self) -> usize {
+        match self {
+            Self::Bin(bytes) => bytes.capacity(),
+            Self::Text(text) => text.capacity(),
+        }
+    }
+}
+
 impl freqfs::FileLoad for File {
+    async fn load_size(
+        _: &std::path::Path,
+        _: &mut tokio::fs::File,
+        metadata: &std::fs::Metadata,
+    ) -> std::io::Result<usize> {
+        // Test codec strings and byte vectors retain at most geometric Vec capacity.
+        usize::try_from(metadata.len())
+            .ok()
+            .and_then(|len| len.max(8).checked_next_power_of_two())
+            .ok_or_else(|| std::io::Error::other("payload size overflow"))
+    }
+
     async fn load(
         _: &std::path::Path,
         file: tokio::fs::File,
@@ -168,6 +195,7 @@ impl freqfs::FileLoad for File {
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
 }
+
 impl freqfs::FileSave for File {
     async fn save(&self, file: &mut tokio::fs::File) -> std::io::Result<u64> {
         use futures::TryStreamExt;

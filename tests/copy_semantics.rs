@@ -16,19 +16,25 @@ enum File {
 
 impl de::FromStream for File {
     type Context = ();
+
     async fn from_stream<D: de::Decoder>(_: (), decoder: &mut D) -> Result<Self, D::Error> {
         decoder.decode_any(FileVisitor).await
     }
 }
+
 struct FileVisitor;
+
 impl de::Visitor for FileVisitor {
     type Value = File;
+
     fn expecting() -> &'static str {
         "a filesystem entry"
     }
+
     fn visit_string<E: de::Error>(self, value: String) -> Result<File, E> {
         Ok(File::Text(value))
     }
+
     async fn visit_seq<A: de::SeqAccess>(self, mut seq: A) -> Result<File, A::Error> {
         let mut bytes = Vec::new();
         while let Some(byte) = seq.next_element::<u8>(()).await? {
@@ -123,9 +129,11 @@ async fn copy_dir_from_preserves_tree_and_contents() -> Result<(), io::Error> {
         std::mem::drop(src_dir);
 
         let mut dst_dir = dst.write().await;
-        dst_dir
-            .create_file("a.txt".to_string(), "old".to_string(), 3)
-            .await?;
+        *dst_dir
+            .get_file("a.txt")
+            .unwrap()
+            .write::<String>(3)
+            .await? = "old".to_string();
         dst_dir.copy_file_from("a.txt".to_string(), &src_a).await?;
 
         let a = dst_dir.get_file("a.txt").expect("a.txt");
@@ -137,7 +145,28 @@ async fn copy_dir_from_preserves_tree_and_contents() -> Result<(), io::Error> {
     Ok(())
 }
 
+impl get_size::GetSize for File {
+    fn get_size(&self) -> usize {
+        match self {
+            Self::Bin(bytes) => bytes.capacity(),
+            Self::Text(text) => text.capacity(),
+        }
+    }
+}
+
 impl freqfs::FileLoad for File {
+    async fn load_size(
+        _: &std::path::Path,
+        _: &mut tokio::fs::File,
+        metadata: &std::fs::Metadata,
+    ) -> std::io::Result<usize> {
+        // Test codec strings and byte vectors retain at most geometric Vec capacity.
+        usize::try_from(metadata.len())
+            .ok()
+            .and_then(|len| len.max(8).checked_next_power_of_two())
+            .ok_or_else(|| std::io::Error::other("payload size overflow"))
+    }
+
     async fn load(
         _: &std::path::Path,
         file: tokio::fs::File,
@@ -148,6 +177,7 @@ impl freqfs::FileLoad for File {
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
 }
+
 impl freqfs::FileSave for File {
     async fn save(&self, file: &mut tokio::fs::File) -> std::io::Result<u64> {
         use futures::TryStreamExt;
