@@ -6,8 +6,7 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use futures::future::Future;
 use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::mpsc::{self, error::TrySendError, Receiver, Sender};
-use tokio::sync::Notify;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio::time::Duration;
 
 use super::dir::DirLock;
@@ -135,7 +134,11 @@ impl<FE> Cache<FE> {
         }
 
         let mut state = self.lock();
-        if state.size.saturating_add(bytes) > self.capacity {
+        if state
+            .size
+            .checked_add(bytes)
+            .is_none_or(|size| size > self.capacity)
+        {
             self.requested.fetch_max(bytes, Ordering::AcqRel);
             self.check(state);
             return Ok(None);
@@ -199,7 +202,14 @@ impl<FE> Cache<FE> {
     pub(crate) fn try_acquire_file_handle(&self) -> Result<OwnedSemaphorePermit> {
         Arc::clone(&self.file_handles)
             .try_acquire_owned()
-            .map_err(|_| io::Error::new(io::ErrorKind::ResourceBusy, "file handle limit reached"))
+            .map_err(|cause| match cause {
+                TryAcquireError::NoPermits => {
+                    io::Error::new(io::ErrorKind::ResourceBusy, "file handle limit reached")
+                }
+                TryAcquireError::Closed => {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "file handle admission closed")
+                }
+            })
     }
 
     // Check the current filesystem floor before writeback. Encoded sizes are
@@ -626,6 +636,44 @@ mod tests {
         let second = waiting.await.unwrap();
         second.commit();
         assert_eq!(cache.lock().size, 1);
+
+        // Exercise accounting overflow without allocating a payload.
+        let cache = Cache::<Entry>::new(usize::MAX, Some(1), 0, Duration::from_secs(1));
+        let full = cache.try_reserve(usize::MAX).unwrap();
+
+        assert_eq!(
+            cache.try_reserve(1).err().unwrap().kind(),
+            std::io::ErrorKind::ResourceBusy
+        );
+        assert_eq!(cache.lock().size, usize::MAX);
+
+        drop(full);
+        assert_eq!(cache.lock().size, 0);
+        drop(cache.try_reserve(1).unwrap());
+    }
+
+    #[tokio::test]
+    async fn file_handle_admission_distinguishes_exhaustion_from_closure() {
+        let cache = Cache::<Entry>::new(10, Some(1), 0, Duration::from_secs(1));
+        let permit = cache.try_acquire_file_handle().unwrap();
+
+        assert_eq!(
+            cache.try_acquire_file_handle().unwrap_err().kind(),
+            std::io::ErrorKind::ResourceBusy
+        );
+
+        drop(permit);
+        drop(cache.try_acquire_file_handle().unwrap());
+
+        cache.file_handles.close();
+        assert_eq!(
+            cache.try_acquire_file_handle().unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(
+            cache.acquire_file_handle().await.unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
     }
 
     #[tokio::test]
