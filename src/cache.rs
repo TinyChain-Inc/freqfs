@@ -1081,7 +1081,11 @@ mod tests {
             let target_guard = target.read::<Vec<u8>>().await?;
             assert_eq!(cache.lock().size, 64);
             drop((source_guard, target_guard));
-            tokio::fs::remove_dir_all(path).await?;
+
+            // Coordinate with any eviction still writing these payloads before
+            // removing their directory; raw filesystem cleanup can race it.
+            root.write().await.truncate_and_sync().await?;
+            assert!(!path.exists());
         }
         Ok(())
     }
