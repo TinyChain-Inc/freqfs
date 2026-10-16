@@ -4,7 +4,9 @@
   bootstrap-created `Cache` accounts actual retained bytes and handles and owns
   one finite, coalescing eviction signal; do not introduce score/decay heuristics,
   process-global managers, or unbounded eviction queues.
-- Admit work before allocating or spawning it. Preserve saturation and I/O errors
+- Admit loading before decoding and complete values before publication. Mutable
+  guards account actual size on release; the cache target is not a strict bound
+  during mutation. Preserve saturation and I/O errors
   for callers; do not panic on ordinary disk-full/resource exhaustion or hide it
   behind retries, alternate roots, or eager memory buffering.
 - Keep reads, writes, and eviction incremental and explicitly bounded. Cancellation

@@ -71,14 +71,14 @@ async fn wrong_type_read_returns_invalid_data() -> Result<(), io::Error> {
 
     let file = {
         let mut dir = root.write().await;
-        dir.create_file("data.bin".to_string(), vec![1u8, 2, 3], 3)
+        dir.create_file("data.bin".to_string(), vec![1u8, 2, 3])
             .await?
     };
 
     let err = file.read::<String>().await.unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::InvalidData);
 
-    let err = file.write::<String>(3).await.unwrap_err();
+    let err = file.write::<String>().await.unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::InvalidData);
 
     file.sync().await?;
@@ -153,7 +153,7 @@ async fn paused_cached_reader_does_not_block_another_reader() -> Result<(), io::
     let file = root
         .write()
         .await
-        .create_file("cached".into(), vec![7u8], 1)
+        .create_file("cached".into(), vec![7u8])
         .await?;
     for mode in 0..3 {
         for budget in 0..128 {

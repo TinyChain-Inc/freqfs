@@ -18,8 +18,9 @@
 //! It may raise an [`std::io::Error`] or panic if this assumption is not valid.
 //!
 //! Adapters declare a decoded-allocation bound before loading and report actual retained
-//! allocation through `GetSize`. Mutable guards admit growth before it occurs. Filesystem
-//! errors, including background eviction failures, propagate to callers unchanged.
+//! allocation through `GetSize`. Mutable guards account actual retained size on release;
+//! growth may exceed the cache target. Filesystem errors, including background eviction
+//! failures, propagate to callers unchanged.
 
 mod cache;
 mod dir;

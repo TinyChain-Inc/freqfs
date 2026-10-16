@@ -120,6 +120,7 @@ impl<FE> Cache<FE> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn try_reserve(self: &Arc<Self>, bytes: usize) -> Result<Reservation<FE>> {
         self.reserve_if_available(bytes)?.ok_or_else(|| {
             io::Error::new(io::ErrorKind::ResourceBusy, "cache capacity is exhausted")
@@ -150,6 +151,21 @@ impl<FE> Cache<FE> {
             bytes,
             committed: false,
         }))
+    }
+
+    // Mutable payloads may exceed the cache target. Account them without discarding
+    // contents; subsequent admissions apply backpressure while eviction catches up.
+    pub(crate) fn reconcile(&self, previous: usize, actual: usize) {
+        if actual == previous {
+            return;
+        }
+
+        let mut state = self.lock();
+        state.size = state.size - previous + actual;
+        self.check(state);
+        if actual < previous {
+            self.capacity_released.notify_waiters();
+        }
     }
 
     pub(crate) fn release(&self, bytes: usize) {
@@ -584,12 +600,12 @@ mod tests {
         let file = root
             .write()
             .await
-            .create_file("data.bin".into(), vec![1_u8], 1)
+            .create_file("data.bin".into(), vec![1_u8])
             .await
             .unwrap();
         for result in [
             file.sync().await,
-            file.replace_all(Entry::Bin(vec![2]), 1).await,
+            file.replace_all(Entry::Bin(vec![2])).await,
             file.clone().evict().unwrap().1.await,
         ] {
             assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::StorageFull);
@@ -808,13 +824,13 @@ mod tests {
         let file = root
             .write()
             .await
-            .create_file("expanded".into(), ExpandedPayload(vec![0; 64]), 80)
+            .create_file("expanded".into(), ExpandedPayload(vec![0; 64]))
             .await?;
         assert_eq!(cache.lock().size, 64);
         let duplicate = root
             .write()
             .await
-            .create_file("expanded".into(), ExpandedPayload(vec![0; 16]), 16)
+            .create_file("expanded".into(), ExpandedPayload(vec![0; 16]))
             .await
             .err()
             .unwrap();
@@ -837,27 +853,24 @@ mod tests {
         assert_eq!(file.read::<ExpandedPayload>().await?.0.len(), 64);
         assert_eq!(cache.lock().size, 64, "preflight slack must be refunded");
         {
-            let mut guard = file.write::<ExpandedPayload>(80).await?;
-            assert_eq!(cache.lock().size, 80);
-            guard.reserve(96).await?;
-            assert_eq!(cache.lock().size, 96);
-            assert_eq!(
-                guard.reserve(160).await.err().unwrap().kind(),
-                std::io::ErrorKind::OutOfMemory
-            );
-            assert_eq!(cache.lock().size, 96);
+            let mut guard = file.write::<ExpandedPayload>().await?;
+            assert_eq!(cache.lock().size, 64);
             guard.0 = vec![0; 72];
+            assert_eq!(cache.lock().size, 64, "account on guard release");
         }
         assert_eq!(cache.lock().size, 72);
         file.sync().await?;
-        assert_eq!(cache.lock().size, 72);
         {
-            let mut guard = file.write_owned::<ExpandedPayload>(80).await?;
-            guard.reserve(96).await?;
-            guard.reserve(80).await?;
-            assert_eq!(cache.lock().size, 96);
+            let mut guard = file.write_owned::<ExpandedPayload>().await?;
+            guard.0 = Vec::with_capacity(96);
+            guard.0.resize(8, 0);
         }
-        assert_eq!(cache.lock().size, 72);
+        assert_eq!(cache.lock().size, 96, "retained capacity, not length");
+        {
+            let mut guard = file.try_write::<ExpandedPayload>()?;
+            guard.0 = vec![0; 16];
+        }
+        assert_eq!(cache.lock().size, 16);
         root.write().await.delete("expanded").await;
         assert_eq!(cache.lock().size, 0);
         tokio::fs::remove_dir_all(path).await?;
@@ -865,7 +878,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admission_precedes_decode_and_bound_violation_fails_closed() -> std::io::Result<()> {
+    async fn loading_admission_and_actual_mutation_accounting() -> std::io::Result<()> {
         let path = unique_tmp_dir();
         tokio::fs::create_dir(&path).await?;
         tokio::fs::write(path.join("oversized"), 4096u64.to_le_bytes()).await?;
@@ -891,19 +904,89 @@ mod tests {
         assert!(root
             .write()
             .await
-            .create_file("bad".into(), ExpandedPayload(vec![0; 32]), 16)
+            .create_file("bad".into(), ExpandedPayload(vec![0; 256]))
             .await
             .is_err());
         assert!(!root.read().await.contains("bad"));
         assert_eq!(cache.lock().size, 16);
         {
-            let mut guard = file.write::<ExpandedPayload>(16).await?;
-            guard.0 = vec![0; 32]; // Deliberately violate the caller admission contract.
+            let mut guard = file.write::<ExpandedPayload>().await?;
+            guard.0 = vec![0; 32];
         }
-        assert!(file.read::<ExpandedPayload>().await.is_err());
-        assert!(file.sync().await.is_err());
-        assert_eq!(cache.lock().size, 0);
+        assert_eq!(file.read::<ExpandedPayload>().await?.0.len(), 32);
+        file.sync().await?;
+        assert_eq!(cache.lock().size, 32);
         tokio::fs::remove_dir_all(path).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mutation_growth_survives_unwind_cancellation_and_eviction() -> std::io::Result<()> {
+        let path = unique_tmp_dir();
+        tokio::fs::create_dir(&path).await?;
+        let cache = Cache::<ExpandedPayload>::new(64, Some(4), 0, Duration::from_millis(100));
+        let root = cache.clone().load(path.clone())?;
+        let file = root
+            .write()
+            .await
+            .create_file("data".into(), ExpandedPayload(vec![0; 16]))
+            .await?;
+
+        let mut guard = file.write::<ExpandedPayload>().await?;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            guard.0 = vec![0; 32];
+            panic!("mutation unwinding");
+        }));
+        assert!(result.is_err());
+        assert_eq!(cache.lock().size, 32);
+        assert_eq!(file.read::<ExpandedPayload>().await?.0.len(), 32);
+
+        let started = Arc::new(Notify::new());
+        let task = tokio::spawn({
+            let file = file.clone();
+            let started = started.clone();
+            async move {
+                let mut guard = file.write_owned::<ExpandedPayload>().await.unwrap();
+                guard.0 = vec![0; 48];
+                started.notify_one();
+                std::future::pending::<()>().await;
+            }
+        });
+        started.notified().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(cache.lock().size, 48);
+
+        {
+            let mut guard = file.try_write_owned::<ExpandedPayload>()?;
+            guard.0 = vec![0; 96];
+        }
+        assert_eq!(cache.lock().size, 96);
+        let pinned = file.read::<ExpandedPayload>().await?;
+        assert_eq!(pinned.0.len(), 96);
+        assert_eq!(cache.file_handles.available_permits(), 3);
+        assert_eq!(
+            cache.reserve(1).await.err().unwrap().kind(),
+            std::io::ErrorKind::ResourceBusy
+        );
+        drop(pinned);
+
+        // Demand admission must reclaim the oversized entry without discarding it.
+        let next = root
+            .write()
+            .await
+            .create_file("next".into(), ExpandedPayload(vec![0; 16]))
+            .await?;
+        assert_eq!(next.read::<ExpandedPayload>().await?.0.len(), 16);
+        assert_eq!(
+            file.read::<ExpandedPayload>().await.err().unwrap().kind(),
+            std::io::ErrorKind::OutOfMemory
+        );
+        let reopened = Cache::<ExpandedPayload>::new(256, Some(4), 0, Duration::from_secs(1))
+            .load(path.clone())?;
+        let restored = reopened.read().await.get_file("data").unwrap().clone();
+        assert_eq!(restored.read::<ExpandedPayload>().await?.0.len(), 96);
+        root.write().await.truncate_and_sync().await?;
         Ok(())
     }
 
