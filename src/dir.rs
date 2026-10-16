@@ -208,8 +208,7 @@ impl<FE: Send + Sync> Dir<FE> {
         FE: GetSize + From<F>,
     {
         let contents: FE = contents.into();
-        let size = contents.get_size();
-        self.create_file::<FE>(name, contents, size).await
+        self.create_file::<FE>(name, contents).await
     }
 
     /// Borrow the [`Path`] of this [`Dir`].
@@ -360,18 +359,14 @@ impl<FE: Send + Sync> Dir<FE> {
 
     /// Convenience method to lock a file for writing.
     /// Returns a "not found" error if the there is no file with the given `name`.
-    pub async fn write_file<Q, F>(
-        &self,
-        name: &Q,
-        retained_bound: usize,
-    ) -> Result<FileWriteGuard<'_, FE, F>>
+    pub async fn write_file<Q, F>(&self, name: &Q) -> Result<FileWriteGuard<'_, FE, F>>
     where
         Q: Name + fmt::Display + ?Sized,
         F: Send + Sync + 'static,
         FE: FileLoad + AsType<F> + From<F>,
     {
         if let Some(file) = self.get_file(name) {
-            file.write(retained_bound).await
+            file.write().await
         } else {
             Err(io::Error::new(io::ErrorKind::NotFound, name.to_string()))
         }
@@ -379,18 +374,14 @@ impl<FE: Send + Sync> Dir<FE> {
 
     /// Convenience method to lock a file for writing.
     /// Returns a "not found" error if the there is no file with the given `name`.
-    pub async fn write_file_owned<Q, F>(
-        &self,
-        name: &Q,
-        retained_bound: usize,
-    ) -> Result<FileWriteGuardOwned<FE, F>>
+    pub async fn write_file_owned<Q, F>(&self, name: &Q) -> Result<FileWriteGuardOwned<FE, F>>
     where
         Q: Name + fmt::Display + ?Sized,
         F: Send + Sync + 'static,
         FE: FileLoad + AsType<F> + From<F>,
     {
         if let Some(file) = self.get_file(name) {
-            file.write_owned(retained_bound).await
+            file.write_owned().await
         } else {
             Err(io::Error::new(io::ErrorKind::NotFound, name.to_string()))
         }
@@ -401,12 +392,7 @@ impl<FE: Send + Sync> Dir<FE> {
     /// Create a new file in this [`Dir`] with the given `contents`.
     /// Returns `AlreadyExists` if the name is present. Use the existing file handle
     /// to replace a payload without changing its identity.
-    pub async fn create_file<F>(
-        &mut self,
-        name: String,
-        contents: F,
-        size: usize,
-    ) -> Result<FileLock<FE>>
+    pub async fn create_file<F>(&mut self, name: String, contents: F) -> Result<FileLock<FE>>
     where
         FE: GetSize + From<F>,
     {
@@ -422,8 +408,7 @@ impl<FE: Send + Sync> Dir<FE> {
 
         let contents: FE = contents.into();
         let actual = contents.get_size();
-        super::file::validate_size(actual, size)?;
-        let mut reservation = self.cache.reserve(size).await?;
+        let reservation = self.cache.reserve(actual).await?;
 
         if self.deleted.remove(&name).is_some() {
             #[cfg(feature = "logging")]
@@ -431,7 +416,6 @@ impl<FE: Send + Sync> Dir<FE> {
         }
 
         let path = self.path.join(&name);
-        reservation.shrink(actual);
         let lock = FileLock::new::<FE>(self.cache.clone(), path.clone(), contents, actual);
         self.contents.insert(name, DirEntry::File(lock.clone()));
         self.cache.insert_reserved(path, lock.clone(), reservation);
@@ -440,11 +424,7 @@ impl<FE: Send + Sync> Dir<FE> {
     }
 
     /// Create a new file in this [`Dir`] with a unique name and the given `contents`.
-    pub async fn create_file_unique<F>(
-        &mut self,
-        contents: F,
-        size: usize,
-    ) -> Result<(Uuid, FileLock<FE>)>
+    pub async fn create_file_unique<F>(&mut self, contents: F) -> Result<(Uuid, FileLock<FE>)>
     where
         FE: GetSize + From<F>,
     {
@@ -455,7 +435,7 @@ impl<FE: Send + Sync> Dir<FE> {
             name = uuid.to_string();
         }
 
-        self.create_file(name, contents, size)
+        self.create_file(name, contents)
             .await
             .map(|file| (uuid, file))
     }

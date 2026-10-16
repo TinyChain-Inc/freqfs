@@ -24,9 +24,9 @@ durably synchronizes their containing directory. It retains that directory and
 does not write back or synchronize surviving children. Use this for reclamation
 after the owning durability protocol has published the removal of references.
 
-For publication records, use `FileLock::replace_all(value, retained_bound)` instead of a
-cached write followed by synchronization. As with file creation, the caller supplies
-a retained-allocation bound; cache capacity is admitted before publication begins.
+For publication records, use `FileLock::replace_all(value)` instead of a
+cached write followed by synchronization. As with file creation, freqfs measures
+the complete value and admits its actual retained size before publication begins.
 The final cache charge is the value's actual `GetSize`, independent of encoded bytes.
 This operation excludes eviction, synchronizes
 the temporary replacement before rename, and then synchronizes its parent. An
@@ -79,18 +79,18 @@ before writeback. It is separate from retained-memory admission and neither
 estimates encoded size nor reserves space for future writes. Native write errors
 propagate to the caller.
 
-Mutable file methods take a retained bound. The existing allocation remains
-admitted, so `write(0)` permits mutation without growth. A write guard's
-`reserve(bound)` admits additional capacity before the caller allocates it. Guard
-drop reconciles the actual charge. A payload exceeding the admitted bound invalidates
-the file and is discarded; later operations fail until caller-coordinated reopening.
-Creation and replacement likewise validate supplied bounds. Creation requires an
-absent name and returns `AlreadyExists` without changing existing handles; mutate
-or replace an existing payload through its file handle. `Dir::create_empty_file`
-derives the actual retained size and uses the same asynchronous admission,
-awaiting reclaimable cache space before publishing the entry. Cancellation before
-admission publishes no entry; unavailable pinned capacity still returns a bounded
-admission error.
+Mutable file guards account actual retained size when released, including unused
+container capacity. Growth may temporarily exceed the cache target; it does not
+invalidate or discard the payload. Eviction reclaims eligible entries and subsequent
+admissions apply backpressure. Concurrent mutations and caller-owned buffers are
+not bounded by the cache target, which is not a host OOM guarantee.
+
+Creation and durable replacement measure complete entries and admit that actual
+size before publication. Creation requires an absent name and returns `AlreadyExists`
+without changing existing handles. Cancellation before admission publishes nothing.
+Loading retains pre-decode admission. An entry grown beyond total cache capacity can
+be synchronized and evicted. Reloading requires its decoded-allocation bound to fit
+the budget; serialization may discard unused in-memory container capacity.
 
 The eviction worker keeps a weak cache reference while idle. Cache entries retain
 payload state without retaining their owning cache; owned guards keep the cache

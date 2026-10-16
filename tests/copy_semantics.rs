@@ -78,16 +78,16 @@ async fn copy_dir_from_preserves_tree_and_contents() -> Result<(), io::Error> {
     {
         let mut src_dir = src.write().await;
         src_dir
-            .create_file("a.txt".to_string(), "hello".to_string(), 5)
+            .create_file("a.txt".to_string(), "hello".to_string())
             .await?;
         src_dir
-            .create_file("b.bin".to_string(), vec![1u8, 2, 3], 3)
+            .create_file("b.bin".to_string(), vec![1u8, 2, 3])
             .await?;
 
         let nested = src_dir.create_dir("nested".to_string())?;
         let mut nested = nested.write().await;
         nested
-            .create_file("c.txt".to_string(), "world".to_string(), 5)
+            .create_file("c.txt".to_string(), "world".to_string())
             .await?;
     }
 
@@ -129,11 +129,7 @@ async fn copy_dir_from_preserves_tree_and_contents() -> Result<(), io::Error> {
         std::mem::drop(src_dir);
 
         let mut dst_dir = dst.write().await;
-        *dst_dir
-            .get_file("a.txt")
-            .unwrap()
-            .write::<String>(3)
-            .await? = "old".to_string();
+        *dst_dir.get_file("a.txt").unwrap().write::<String>().await? = "old".to_string();
         dst_dir.copy_file_from("a.txt".to_string(), &src_a).await?;
 
         let a = dst_dir.get_file("a.txt").expect("a.txt");

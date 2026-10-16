@@ -92,7 +92,7 @@ async fn run_example(cache: DirLock<File>) -> Result<(), io::Error> {
 
         {
             // to load a file into memory, acquire a lock on its contents
-            let mut contents: FileWriteGuard<File, String> = text_file.write(64).await?;
+            let mut contents: FileWriteGuard<File, String> = text_file.write().await?;
             assert_eq!(&*contents, "Hello, world!");
 
             // then they can be mutated purely in-memory
@@ -120,7 +120,7 @@ async fn run_example(cache: DirLock<File>) -> Result<(), io::Error> {
         // create a new file "vector.bin"
         // this is a synchronous operation since it happens in-memory only
         let binary_file = sub_sub_dir
-            .create_file("vector.bin".to_string(), (0..25).collect::<Vec<u8>>(), 25)
+            .create_file("vector.bin".to_string(), (0..25).collect::<Vec<u8>>())
             .await?;
 
         // then lock it so its data won't be evicted

@@ -79,7 +79,7 @@ async fn sync_virtual_empty_hierarchy_then_publish_a_file() -> Result<(), io::Er
     child
         .write()
         .await
-        .create_file("value".into(), "durable".to_owned(), 7)
+        .create_file("value".into(), "durable".to_owned())
         .await?;
     root.sync_all().await?;
     assert!(path.join("parent/child/value").is_file());
@@ -98,11 +98,11 @@ async fn delete_then_recreate_file_and_dir() -> Result<(), io::Error> {
         let mut dir = root.write().await;
 
         // Keep a sibling to verify deletion isolation.
-        dir.create_file("keep.txt".to_string(), "keep".to_string(), 4)
+        dir.create_file("keep.txt".to_string(), "keep".to_string())
             .await?;
 
         let file = dir
-            .create_file("a.txt".to_string(), "first".to_string(), 5)
+            .create_file("a.txt".to_string(), "first".to_string())
             .await?;
         file.sync().await?;
     }
@@ -121,7 +121,7 @@ async fn delete_then_recreate_file_and_dir() -> Result<(), io::Error> {
     {
         let mut dir = root.write().await;
         let file = dir
-            .create_file("a.txt".to_string(), "second".to_string(), 6)
+            .create_file("a.txt".to_string(), "second".to_string())
             .await?;
         file.sync().await?;
     }
@@ -142,7 +142,7 @@ async fn delete_then_recreate_file_and_dir() -> Result<(), io::Error> {
         {
             let mut subdir = subdir.write().await;
             let file = subdir
-                .create_file("x.txt".to_string(), "x".to_string(), 1)
+                .create_file("x.txt".to_string(), "x".to_string())
                 .await?;
             file.sync().await?;
         }
@@ -165,7 +165,7 @@ async fn delete_then_recreate_file_and_dir() -> Result<(), io::Error> {
 
         let mut subdir = subdir.write().await;
         let file = subdir
-            .create_file("y.txt".to_string(), "y".to_string(), 1)
+            .create_file("y.txt".to_string(), "y".to_string())
             .await?;
         file.sync().await?;
     }

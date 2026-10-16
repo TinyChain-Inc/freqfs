@@ -94,7 +94,7 @@ async fn run_example(cache: DirLock<File>) -> Result<(), io::Error> {
         let text_file = root.get_file("hello.txt").expect("text file");
 
         {
-            let mut contents: FileWriteGuard<File, String> = text_file.write(64).await?;
+            let mut contents: FileWriteGuard<File, String> = text_file.write().await?;
             assert_eq!(&*contents, "Hello, world!");
             *contents = "नमस्ते दुनिया!".to_string();
         }
@@ -114,7 +114,7 @@ async fn run_example(cache: DirLock<File>) -> Result<(), io::Error> {
         let mut sub_sub_dir = sub_sub_dir.write().await;
 
         let binary_file = sub_sub_dir
-            .create_file("vector.bin".to_string(), (0..25).collect::<Vec<u8>>(), 25)
+            .create_file("vector.bin".to_string(), (0..25).collect::<Vec<u8>>())
             .await?;
 
         let binary_file: FileReadGuard<Vec<u8>> = binary_file.read().await?;

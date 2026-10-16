@@ -80,7 +80,7 @@ async fn concurrent_read_write_does_not_deadlock() -> Result<(), io::Error> {
     for i in 0..32usize {
         let file_for_write = file.clone();
         join_set.spawn(async move {
-            let mut contents: FileWriteGuard<File, String> = file_for_write.write(64).await?;
+            let mut contents: FileWriteGuard<File, String> = file_for_write.write().await?;
             *contents = format!("value-{i}");
             Ok::<(), io::Error>(())
         });
