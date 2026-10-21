@@ -67,12 +67,17 @@ the codec you choose. Tests and examples demonstrate caller-owned TBON adapters.
 
 ## Retained allocation and admission
 
-`FileLoad::load_size` inspects encoded data with bounded scratch and reports an upper
-bound for the decoded allocation before `load` runs. The cache reserves this bound,
-rewinds the file, decodes, validates `GetSize`, and immediately refunds unused
-capacity. `FileSave` reports bytes written; those bytes never replace the cache's
-retained-memory charge. Adapters own both codec-specific size inspection and actual
-capacity accounting, including spare capacity in vectors and other containers.
+`FileLoad::load` decodes once under the existing file-state lock and file-handle
+permit. The cache measures the complete entry with `GetSize`, admits that actual
+size, then publishes it. Resident copying likewise measures the completed clone
+before admission and replacement. Failed or cancelled admission drops the temporary
+value without publishing it. `FileSave` reports bytes written; those bytes never
+replace the retained-memory charge, which includes spare container capacity.
+
+Decoded and cloned values awaiting admission already occupy memory outside the
+cache target. File-handle permits bound concurrent operations, not their combined
+bytes. Adapters retain structural decoding limits; cache admission does not
+provide a decode-time memory ceiling or guarantee against host OOM.
 
 The configured minimum free-disk threshold checks current filesystem free space
 before writeback. It is separate from retained-memory admission and neither
@@ -88,9 +93,9 @@ not bounded by the cache target, which is not a host OOM guarantee.
 Creation and durable replacement measure complete entries and admit that actual
 size before publication. Creation requires an absent name and returns `AlreadyExists`
 without changing existing handles. Cancellation before admission publishes nothing.
-Loading retains pre-decode admission. An entry grown beyond total cache capacity can
-be synchronized and evicted. Reloading requires its decoded-allocation bound to fit
-the budget; serialization may discard unused in-memory container capacity.
+An entry grown beyond total cache capacity can be synchronized and evicted.
+Reloading requires the actual decoded size to fit the budget; serialization may
+discard unused in-memory container capacity.
 
 The eviction worker keeps a weak cache reference while idle. Cache entries retain
 payload state without retaining their owning cache; owned guards keep the cache

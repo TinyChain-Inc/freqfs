@@ -187,18 +187,6 @@ impl get_size::GetSize for File {
 }
 
 impl freqfs::FileLoad for File {
-    async fn load_size(
-        _: &std::path::Path,
-        _: &mut tokio::fs::File,
-        metadata: &std::fs::Metadata,
-    ) -> std::io::Result<usize> {
-        // Test codec strings and byte vectors retain at most geometric Vec capacity.
-        usize::try_from(metadata.len())
-            .ok()
-            .and_then(|len| len.max(8).checked_next_power_of_two())
-            .ok_or_else(|| std::io::Error::other("payload size overflow"))
-    }
-
     async fn load(
         _: &std::path::Path,
         file: tokio::fs::File,

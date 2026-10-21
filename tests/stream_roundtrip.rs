@@ -50,14 +50,6 @@ impl get_size::GetSize for FileValue {
 }
 
 impl freqfs::FileLoad for FileValue {
-    async fn load_size(
-        _: &std::path::Path,
-        _: &mut tokio::fs::File,
-        _: &std::fs::Metadata,
-    ) -> std::io::Result<usize> {
-        Ok(8)
-    }
-
     async fn load(
         _: &std::path::Path,
         file: tokio::fs::File,
