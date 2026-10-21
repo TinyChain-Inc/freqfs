@@ -108,18 +108,6 @@ impl get_size::GetSize for File {
 }
 
 impl freqfs::FileLoad for File {
-    async fn load_size(
-        _: &std::path::Path,
-        _: &mut tokio::fs::File,
-        metadata: &std::fs::Metadata,
-    ) -> std::io::Result<usize> {
-        // Test codec strings and byte vectors retain at most geometric Vec capacity.
-        usize::try_from(metadata.len())
-            .ok()
-            .and_then(|len| len.max(8).checked_next_power_of_two())
-            .ok_or_else(|| std::io::Error::other("payload size overflow"))
-    }
-
     async fn load(
         _: &std::path::Path,
         file: tokio::fs::File,
@@ -175,7 +163,11 @@ async fn paused_cached_reader_does_not_block_another_reader() -> Result<(), io::
             let read =
                 tokio::time::timeout(std::time::Duration::from_secs(1), file.read::<Vec<u8>>())
                     .await
-                    .expect("paused cached read retained an exclusive state guard")?;
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "paused cached read blocked another reader (mode {mode}, budget {budget}): {error}"
+                        )
+                    })?;
             assert_eq!(read[0], 7);
             drop(read);
             drop(buffered);

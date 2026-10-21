@@ -17,9 +17,10 @@
 //! (not e.g. via [`tokio::fs`] or [`std::fs`] elsewhere).
 //! It may raise an [`std::io::Error`] or panic if this assumption is not valid.
 //!
-//! Adapters declare a decoded-allocation bound before loading and report actual retained
-//! allocation through `GetSize`. Mutable guards account actual retained size on release;
-//! growth may exceed the cache target. Filesystem errors, including background eviction
+//! Loading decodes once and admits the actual retained size reported by `GetSize`
+//! before publication. Mutable guards reconcile actual size on release. Decoded or
+//! cloned temporaries and mutation growth may exceed the cache target; it is not
+//! a strict allocation ceiling or a host OOM guarantee. Filesystem errors, including background eviction
 //! failures, propagate to callers unchanged.
 
 mod cache;
