@@ -163,7 +163,11 @@ async fn paused_cached_reader_does_not_block_another_reader() -> Result<(), io::
             let read =
                 tokio::time::timeout(std::time::Duration::from_secs(1), file.read::<Vec<u8>>())
                     .await
-                    .expect("paused cached read retained an exclusive state guard")?;
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "paused cached read blocked another reader (mode {mode}, budget {budget}): {error}"
+                        )
+                    })?;
             assert_eq!(read[0], 7);
             drop(read);
             drop(buffered);

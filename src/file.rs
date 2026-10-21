@@ -430,7 +430,12 @@ impl<FE> FileLock<FE> {
         FE: FileLoad + AsType<F> + From<F>,
     {
         let permit = self.cache.acquire_file_handle().await?;
-        let mut state = self.state.write().await;
+        // A ready cached read must not yield with exclusive state access.
+        // Async lock acquisition may consume its cooperative budget after locking.
+        let mut state = match self.state.try_write() {
+            Ok(state) => state,
+            Err(_) => self.state.write().await,
+        };
 
         state.check_available()?;
 
@@ -492,7 +497,12 @@ impl<FE> FileLock<FE> {
         FE: FileLoad + AsType<F> + From<F>,
     {
         let permit = self.cache.acquire_file_handle().await?;
-        let mut state = self.state.write().await;
+        // A ready cached read must not yield with exclusive state access.
+        // Async lock acquisition may consume its cooperative budget after locking.
+        let mut state = match self.state.try_write() {
+            Ok(state) => state,
+            Err(_) => self.state.write().await,
+        };
 
         state.check_available()?;
 
@@ -563,7 +573,12 @@ impl<FE> FileLock<FE> {
         FE: FileLoad + AsType<F> + From<F>,
     {
         let permit = self.cache.acquire_file_handle().await?;
-        let mut state = self.state.write().await;
+        // A ready cached read must not yield with exclusive state access.
+        // Async lock acquisition may consume its cooperative budget after locking.
+        let mut state = match self.state.try_write() {
+            Ok(state) => state,
+            Err(_) => self.state.write().await,
+        };
 
         state.check_available()?;
 
