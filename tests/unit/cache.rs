@@ -1,15 +1,14 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::StreamExt;
 use safecast::as_type;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::mpsc;
-use tokio::sync::Semaphore;
+use tokio::sync::{mpsc, Semaphore};
 
-use super::{AtomicUsize, Cache, Notify, State, MAX_FILE_HANDLES};
+use super::{Cache, Notify, State, MAX_FILE_HANDLES};
 use crate::file::FileSave;
 use crate::FileLock;
 
@@ -75,10 +74,7 @@ async fn lfu_eviction_prefers_least_used() -> std::io::Result<()> {
     let (tx, _rx) = mpsc::channel(1);
 
     let cache = Arc::new(Cache {
-        gc_pending: AtomicBool::new(false),
-        eviction_error: Mutex::new(None),
-        requested: AtomicUsize::new(0),
-        capacity: 10,
+        capacity: 20,
         max_file_handles: MAX_FILE_HANDLES,
         minimum_free_disk_bytes: 0,
         file_handles: Arc::new(Semaphore::new(MAX_FILE_HANDLES)),
@@ -88,27 +84,43 @@ async fn lfu_eviction_prefers_least_used() -> std::io::Result<()> {
         tx,
     });
 
-    let path_a = tmp.join("a.bin");
-    let path_b = tmp.join("b.bin");
+    let paths = ["a.bin", "b.bin", "c.bin", "d.bin", "e.bin"].map(|name| tmp.join(name));
+    let files: [FileLock<Entry>; 5] = std::array::from_fn(|i| {
+        FileLock::new(cache.clone(), paths[i].clone(), vec![i as u8; 10], 10)
+    });
+    for (path, file) in paths.iter().zip(&files) {
+        cache.insert(path.clone(), file.clone(), 10);
+    }
 
-    let file_a: FileLock<Entry> = FileLock::new(cache.clone(), path_a.clone(), vec![1u8; 10], 10);
-    let file_b: FileLock<Entry> = FileLock::new(cache.clone(), path_b.clone(), vec![2u8; 10], 10);
-
-    cache.insert(path_a.clone(), file_a.clone(), 10);
-    cache.insert(path_b.clone(), file_b.clone(), 10);
-
-    // make `a.bin` the most frequently used
-    cache.bump(&path_a, None);
+    // [e, d, c, b, a] becomes [e, d, c, a, b], rather than moving a to the front.
+    cache.bump(&paths[0]);
+    cache.remove(&paths[2], 10);
+    assert_eq!(
+        cache
+            .lock()
+            .files
+            .iter()
+            .map(|(path, _)| path)
+            .collect::<Vec<_>>(),
+        vec![&paths[4], &paths[3], &paths[0], &paths[1]]
+    );
 
     let mut evictions = cache.gc_for(0);
+    assert_eq!(evictions.len(), 2);
     while let Some(result) = evictions.next().await {
         result?;
     }
 
-    assert!(file_a.try_read::<Vec<u8>>().is_ok());
-
-    let evicted = file_b.try_read::<Vec<u8>>().unwrap_err();
-    assert_eq!(evicted.kind(), std::io::ErrorKind::WouldBlock);
+    // Back-to-front eviction removes b, then a. Move-to-front would evict d.
+    for file in &files[..2] {
+        assert_eq!(
+            file.try_read::<Vec<u8>>().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+    for file in &files[2..] {
+        assert!(file.try_read::<Vec<u8>>().is_ok());
+    }
 
     let _ = tokio::fs::remove_dir_all(&tmp).await;
     Ok(())
@@ -122,9 +134,6 @@ fn tiny_capacity_coalesces_duplicate_evict_signals() {
     let (tx, mut rx) = mpsc::channel(1);
 
     let cache = Arc::new(Cache {
-        gc_pending: AtomicBool::new(false),
-        eviction_error: Mutex::new(None),
-        requested: AtomicUsize::new(0),
         capacity: 1,
         max_file_handles: MAX_FILE_HANDLES,
         minimum_free_disk_bytes: 0,
@@ -149,7 +158,7 @@ fn tiny_capacity_coalesces_duplicate_evict_signals() {
     cache.insert(path_b, file_b, 2);
     assert!(rx.try_recv().is_err());
 
-    cache.gc_pending.store(false, Ordering::Release);
+    cache.lock().gc_pending = false;
 
     cache.insert(path_c, file_c, 2);
     assert!(rx.try_recv().is_ok());
@@ -163,7 +172,7 @@ async fn disk_reserve_rejects_before_a_write() {
     std::fs::create_dir_all(&tmp).expect("create test dir");
     let cache = Cache::<Entry>::new(10, Some(1), u64::MAX, Duration::from_secs(3));
 
-    let root = cache.load(tmp.clone()).unwrap();
+    let root = cache.clone().load(tmp.clone()).unwrap();
     let file = root
         .write()
         .await
@@ -173,7 +182,7 @@ async fn disk_reserve_rejects_before_a_write() {
     for result in [
         file.sync().await,
         file.replace_all(Entry::Bin(vec![2])).await,
-        file.clone().evict().unwrap().1.await,
+        file.cached().evict(&cache).unwrap().1.await,
     ] {
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::StorageFull);
     }
@@ -186,21 +195,16 @@ async fn disk_reserve_rejects_before_a_write() {
 #[tokio::test]
 async fn file_handle_admission_waits_and_recovers() {
     let cache = Cache::<Entry>::new(10, Some(1), 0, Duration::from_secs(1));
-    let first = FileLock::new(
-        cache.clone(),
-        PathBuf::from("first.bin"),
-        Entry::Bin(vec![1]),
-        1,
-    );
-    let second = FileLock::new(cache, PathBuf::from("second.bin"), Entry::Bin(vec![2]), 1);
-    let first_guard = first.read::<Vec<u8>>().await.unwrap();
-    let waiting = second.read::<Vec<u8>>();
+    let first = cache.acquire_file_handle().await.unwrap();
+    let waiting = cache.acquire_file_handle();
     tokio::pin!(waiting);
     assert!(futures::poll!(&mut waiting).is_pending());
 
-    drop(first_guard);
-    let second_guard = waiting.await.unwrap();
-    assert_eq!(&*second_guard, &[2]);
+    drop(first);
+    let second = waiting.await.unwrap();
+    assert_eq!(cache.file_handles.available_permits(), 0);
+    drop(second);
+    assert_eq!(cache.file_handles.available_permits(), 1);
 }
 
 #[tokio::test]
@@ -268,12 +272,12 @@ async fn initial_creation_reclaims_unlocked_payloads() -> std::io::Result<()> {
     let first = root
         .write()
         .await
-        .create_empty_file("first".into(), vec![0u8; 96])
+        .create_file("first".into(), vec![0u8; 96])
         .await?;
     let second = root
         .write()
         .await
-        .create_empty_file("second".into(), vec![0u8; 64])
+        .create_file("second".into(), vec![0u8; 64])
         .await?;
     assert_eq!(cache.lock().size, 64);
     assert_eq!(cache.file_handles.available_permits(), 2);
@@ -294,12 +298,12 @@ async fn initial_creation_timeout_and_cancellation_publish_nothing() -> std::io:
         let first = root
             .write()
             .await
-            .create_empty_file("first".into(), vec![0u8; 64])
+            .create_file("first".into(), vec![0u8; 64])
             .await?;
         let pinned = first.read::<Vec<u8>>().await?;
         let mut contents = root.write().await;
         {
-            let waiting = contents.create_empty_file("second".into(), vec![0u8; 16]);
+            let waiting = contents.create_file("second".into(), vec![0u8; 16]);
             futures::pin_mut!(waiting);
             assert!(futures::poll!(&mut waiting).is_pending());
             if !cancel {
@@ -311,11 +315,9 @@ async fn initial_creation_timeout_and_cancellation_publish_nothing() -> std::io:
         }
         assert!(!contents.contains("second"));
         assert_eq!(cache.lock().size, 64);
-        assert_eq!(cache.file_handles.available_permits(), 1);
+        assert_eq!(cache.file_handles.available_permits(), 2);
         drop(pinned);
-        contents
-            .create_empty_file("second".into(), vec![0u8; 16])
-            .await?;
+        contents.create_file("second".into(), vec![0u8; 16]).await?;
         assert!(contents.contains("second"));
         assert_eq!(cache.lock().size, 16);
         assert_eq!(cache.file_handles.available_permits(), 2);
@@ -437,7 +439,7 @@ async fn loading_cancellation_and_timeout_leave_pending_files_reusable() -> std:
                 assert_eq!(read.await.err().unwrap().kind(), std::io::ErrorKind::ResourceBusy);
             }
         }).await;
-        assert_eq!(cache.file_handles.available_permits(), 2);
+        assert_eq!(cache.file_handles.available_permits(), 3);
         assert_eq!(cache.lock().size, 64);
         drop(pinned);
         let (left, right) = DECODE_OBSERVER
@@ -529,7 +531,7 @@ async fn retained_allocation_is_independent_of_encoded_size() -> std::io::Result
     let duplicate = root
         .write()
         .await
-        .create_empty_file("expanded".into(), ExpandedPayload(vec![0; 16]))
+        .create_file("expanded".into(), ExpandedPayload(vec![0; 16]))
         .await
         .err()
         .unwrap();
@@ -539,7 +541,7 @@ async fn retained_allocation_is_independent_of_encoded_size() -> std::io::Result
     file.sync().await?;
     assert_eq!(tokio::fs::metadata(file.path()).await?.len(), 8);
     assert_eq!(cache.lock().size, 64);
-    file.clone().evict().unwrap().1.await?;
+    file.cached().evict(&cache).unwrap().1.await?;
     assert_eq!(cache.lock().size, 0);
     assert_eq!(file.read::<ExpandedPayload>().await?.0.len(), 64);
     assert_eq!(
@@ -593,7 +595,7 @@ async fn loading_admission_and_actual_mutation_accounting() -> std::io::Result<(
     let file = root
         .write()
         .await
-        .create_empty_file("small".into(), ExpandedPayload(vec![0; 16]))
+        .create_file("small".into(), ExpandedPayload(vec![0; 16]))
         .await?;
     assert_eq!(cache.lock().size, 16);
     assert!(root
@@ -604,14 +606,179 @@ async fn loading_admission_and_actual_mutation_accounting() -> std::io::Result<(
         .is_err());
     assert!(!root.read().await.contains("bad"));
     assert_eq!(cache.lock().size, 16);
+
+    let cache_owners = Arc::strong_count(&cache);
     {
         let mut guard = file.write::<ExpandedPayload>().await?;
+        assert_eq!(Arc::strong_count(&cache), cache_owners);
         guard.0 = vec![0; 32];
     }
+
+    {
+        let guard = file.try_write::<ExpandedPayload>()?;
+        assert_eq!(Arc::strong_count(&cache), cache_owners);
+        assert_eq!(guard.0.len(), 32);
+    }
+
     assert_eq!(file.read::<ExpandedPayload>().await?.0.len(), 32);
     file.sync().await?;
     assert_eq!(cache.lock().size, 32);
     tokio::fs::remove_dir_all(path).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn cached_guards_do_not_require_io_admission() -> std::io::Result<()> {
+    let path = unique_tmp_dir();
+    tokio::fs::create_dir(&path).await?;
+    tokio::fs::write(path.join("pending"), [7]).await?;
+    let cache = Cache::<Entry>::new(128, Some(1), 0, Duration::from_secs(3));
+    let root = cache.clone().load(path)?;
+    let pending = root.read().await.get_file("pending").unwrap().clone();
+    let resident = root
+        .write()
+        .await
+        .create_file("resident".into(), vec![1u8; 16])
+        .await?;
+    let permit = cache.try_acquire_file_handle()?;
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let borrowed = resident.read::<Vec<u8>>().await?;
+        let owned = resident.read_owned::<Vec<u8>>().await?;
+        let consumed = resident.clone().into_read::<Vec<u8>>().await?;
+        assert_eq!(&*borrowed, &[1; 16]);
+        assert_eq!(&*owned, &*borrowed);
+        assert_eq!(&*consumed, &*borrowed);
+        assert_eq!(&*resident.try_read::<Vec<u8>>()?, &*borrowed);
+        assert_eq!(&*resident.try_read_owned::<Vec<u8>>()?, &*borrowed);
+        drop((borrowed, owned, consumed));
+
+        resident.write::<Vec<u8>>().await?[0] = 2;
+        resident.write_owned::<Vec<u8>>().await?[1] = 3;
+        resident.clone().into_write::<Vec<u8>>().await?[2] = 4;
+        resident.try_write::<Vec<u8>>()?[3] = 5;
+        resident.try_write_owned::<Vec<u8>>()?[4] = 6;
+        assert_eq!(&resident.read::<Vec<u8>>().await?[..5], &[2, 3, 4, 5, 6]);
+        Ok::<_, std::io::Error>(())
+    })
+    .await
+    .unwrap()?;
+
+    assert_eq!(
+        pending.try_read::<Vec<u8>>().err().unwrap().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert_eq!(
+        pending.try_read_owned::<Vec<u8>>().err().unwrap().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert_eq!(
+        pending.try_write::<Vec<u8>>().err().unwrap().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert_eq!(
+        pending.try_write_owned::<Vec<u8>>().err().unwrap().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    let mut loading = Box::pin(pending.read::<Vec<u8>>());
+    assert!(futures::poll!(&mut loading).is_pending());
+    drop(loading);
+    assert_eq!(cache.lock().size, 16);
+    drop(permit);
+
+    // Retained cached guards must not prevent cold loading or writeback.
+    let pinned = resident.read::<Vec<u8>>().await?;
+    let loaded = pending.read_owned::<Vec<u8>>().await?;
+    assert_eq!(&*loaded, &[7]);
+    assert_eq!(cache.file_handles.available_permits(), 1);
+    pending.sync_all().await?;
+    assert_eq!(cache.file_handles.available_permits(), 1);
+    drop((pinned, loaded));
+    root.write().await.truncate_and_sync().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn clean_eviction_is_bounded_without_io_admission() -> std::io::Result<()> {
+    let path = unique_tmp_dir();
+    tokio::fs::create_dir(&path).await?;
+    let cache = Cache::<Entry>::new(64, Some(2), 0, Duration::from_secs(3));
+    let root = cache.clone().load(path)?;
+
+    // The oldest entry needs writeback; scanning must skip it when I/O is full.
+    let dirty = root
+        .write()
+        .await
+        .create_file("dirty".into(), vec![9u8])
+        .await?;
+    for i in 0..4 {
+        let file = root
+            .write()
+            .await
+            .create_file(i.to_string(), vec![i as u8])
+            .await?;
+        file.sync().await?;
+    }
+    let first = cache.try_acquire_file_handle()?;
+    let second = cache.try_acquire_file_handle()?;
+
+    for remaining in [3, 1] {
+        let mut evictions = cache.gc_for(64);
+        assert_eq!(evictions.len(), 2);
+        while let Some(result) = evictions.next().await {
+            result?;
+        }
+        assert_eq!(cache.lock().size, remaining);
+    }
+    assert!(cache.gc_for(64).is_empty());
+    assert_eq!(&*dirty.try_read::<Vec<u8>>()?, &[9]);
+    drop((first, second));
+
+    // Cancelling a prepared dirty eviction releases both guards and admission.
+    let evictions = cache.gc_for(64);
+    assert_eq!(evictions.len(), 1);
+    assert_eq!(cache.file_handles.available_permits(), 1);
+    drop(evictions);
+    assert_eq!(cache.file_handles.available_permits(), 2);
+    assert_eq!(&*dirty.try_read::<Vec<u8>>()?, &[9]);
+    let mut evictions = cache.gc_for(64);
+    evictions.next().await.unwrap()?;
+    assert_eq!(cache.lock().size, 0);
+    assert_eq!(tokio::fs::read(dirty.path()).await?, [9]);
+    root.write().await.truncate_and_sync().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn completed_load_releases_admission_for_eviction_at_limit_one() -> std::io::Result<()> {
+    let path = unique_tmp_dir();
+    tokio::fs::create_dir(&path).await?;
+    tokio::fs::write(path.join("pending"), 32u64.to_le_bytes()).await?;
+    let cache = Cache::<ExpandedPayload>::new(32, Some(1), 0, Duration::from_secs(3));
+    let root = cache.clone().load(path.clone())?;
+    let pending = root.read().await.get_file("pending").unwrap().clone();
+    let resident = root
+        .write()
+        .await
+        .create_file("resident".into(), ExpandedPayload(vec![1; 32]))
+        .await?;
+    let guard = tokio::time::timeout(
+        Duration::from_secs(3),
+        pending.into_read::<ExpandedPayload>(),
+    )
+    .await
+    .unwrap()?;
+    assert_eq!(guard.0.len(), 32);
+    assert_eq!(cache.file_handles.available_permits(), 1);
+    assert_eq!(cache.lock().size, 32);
+    assert_eq!(tokio::fs::metadata(resident.path()).await?.len(), 8);
+    drop(guard);
+    assert_eq!(cache.file_handles.available_permits(), 1);
+    assert_eq!(
+        resident.try_read::<ExpandedPayload>().err().unwrap().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    root.write().await.truncate_and_sync().await?;
     Ok(())
 }
 
@@ -659,7 +826,7 @@ async fn mutation_growth_survives_unwind_cancellation_and_eviction() -> std::io:
     assert_eq!(cache.lock().size, 96);
     let pinned = file.read::<ExpandedPayload>().await?;
     assert_eq!(pinned.0.len(), 96);
-    assert_eq!(cache.file_handles.available_permits(), 3);
+    assert_eq!(cache.file_handles.available_permits(), 4);
     assert_eq!(
         cache.reserve(1).await.err().unwrap().kind(),
         std::io::ErrorKind::ResourceBusy
@@ -695,7 +862,7 @@ async fn owned_guard_retains_cache_without_worker_or_entry_cycles() -> std::io::
     let file = root
         .write()
         .await
-        .create_empty_file("small".into(), vec![0u8; 16])
+        .create_file("small".into(), vec![0u8; 16])
         .await?;
     let guard = file.read_owned::<Vec<u8>>().await?;
     drop(file);
@@ -716,7 +883,7 @@ async fn eviction_preserves_original_io_error() -> std::io::Result<()> {
     let root = cache.clone().load(path.clone())?;
     root.write()
         .await
-        .create_empty_file("small".into(), vec![0u8; 16])
+        .create_file("small".into(), vec![0u8; 16])
         .await?;
     let cause = cache.reserve(1).await.err().expect("eviction must fail");
     assert_eq!(cause.kind(), std::io::ErrorKind::StorageFull);
@@ -725,7 +892,7 @@ async fn eviction_preserves_original_io_error() -> std::io::Result<()> {
 
     // ResourceBusy from I/O is an error, not a signal to wait for capacity.
     for wait in [false, true] {
-        *cache.eviction_error.lock().unwrap() = Some(std::io::Error::new(
+        cache.lock().eviction_error = Some(std::io::Error::new(
             std::io::ErrorKind::ResourceBusy,
             "original eviction error",
         ));
@@ -752,12 +919,12 @@ async fn copy_admits_its_clone_before_replacing_the_old_payload() -> std::io::Re
         let source = root
             .write()
             .await
-            .create_empty_file("source".into(), vec![1u8; 32])
+            .create_file("source".into(), vec![1u8; 32])
             .await?;
         let target = root
             .write()
             .await
-            .create_empty_file("target".into(), vec![2u8; 32])
+            .create_file("target".into(), vec![2u8; 32])
             .await?;
         let result = target.overwrite(&source).await;
         if capacity == 64 {
@@ -783,4 +950,227 @@ async fn copy_admits_its_clone_before_replacing_the_old_payload() -> std::io::Re
         assert!(!path.exists());
     }
     Ok(())
+}
+
+#[tokio::test]
+async fn poisoned_cache_rejects_admission_without_inspecting_contents() {
+    for bookkeeping in [true, false] {
+        let cache = Cache::<Entry>::new(1024, None, 0, Duration::from_secs(3));
+        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if bookkeeping {
+                let _state = cache.state.lock().unwrap();
+                panic!("injected cache state failure");
+            } else {
+                let _state = cache.state.lock().unwrap();
+                panic!("injected eviction state failure");
+            }
+        }));
+        assert!(poison.is_err());
+        let admission = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _reservation = try_reserve(&cache, 1);
+        }));
+        assert!(admission.is_err(), "poisoning is not an ordinary I/O error");
+        assert!(
+            cache.state.is_poisoned(),
+            "both bookkeeping domains share one mutex"
+        );
+    }
+}
+
+thread_local! {
+    static CLEANUP_OBSERVER: std::cell::RefCell<Option<Arc<CleanupObservation>>> = const { std::cell::RefCell::new(None) };
+    static ROOT_GATE: std::cell::RefCell<Option<(
+        std::sync::mpsc::SyncSender<()>,
+        std::sync::mpsc::Receiver<()>,
+    )>> = const { std::cell::RefCell::new(None) };
+    static FAIL_FILE_LOAD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[derive(Default)]
+pub(crate) struct CleanupObservation {
+    passes: AtomicUsize,
+    changed: Notify,
+}
+
+pub(crate) fn cleanup_observer() -> Option<Arc<CleanupObservation>> {
+    CLEANUP_OBSERVER.with(|observation| observation.borrow().clone())
+}
+
+pub(crate) fn cleanup_pass_finished(observation: Option<&CleanupObservation>) {
+    if let Some(observation) = observation {
+        observation.passes.fetch_add(1, Ordering::SeqCst);
+        observation.changed.notify_one();
+    }
+}
+
+#[derive(Default)]
+struct WakeCount(AtomicUsize);
+
+impl futures::task::ArcWake for WakeCount {
+    fn wake_by_ref(this: &Arc<Self>) {
+        this.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+async fn pinned_capacity_waits_without_spinning_and_wakes_on_release() -> std::io::Result<()> {
+    use std::future::Future;
+
+    for owned in [false, true] {
+        let path = unique_tmp_dir();
+        tokio::fs::create_dir(&path).await?;
+        let observation = Arc::new(CleanupObservation::default());
+        CLEANUP_OBSERVER.with(|slot| *slot.borrow_mut() = Some(observation.clone()));
+        let cache = Cache::<Entry>::new(8, Some(1), 0, Duration::from_secs(3));
+        CLEANUP_OBSERVER.with(|slot| *slot.borrow_mut() = None);
+        let root = cache.clone().load(path)?;
+        let file = root
+            .write()
+            .await
+            .create_file("pinned".into(), vec![1; 8])
+            .await?;
+        let borrowed = if !owned {
+            Some(file.read::<Vec<u8>>().await?)
+        } else {
+            None
+        };
+        let retained = if owned {
+            Some(file.read_owned::<Vec<u8>>().await?)
+        } else {
+            None
+        };
+        let wake = Arc::new(WakeCount::default());
+        let waker = futures::task::waker_ref(&wake);
+        let mut context = std::task::Context::from_waker(&waker);
+        let mut waiting = std::pin::pin!(cache.reserve(1));
+        assert!(waiting.as_mut().poll(&mut context).is_pending());
+        tokio::time::timeout(Duration::from_secs(3), observation.changed.notified())
+            .await
+            .unwrap();
+        assert_eq!(observation.passes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            wake.0.load(Ordering::SeqCst),
+            0,
+            "an empty pass must not wake admission"
+        );
+        drop((borrowed, retained));
+        assert!(wake.0.load(Ordering::SeqCst) > 0);
+        let reserved = tokio::time::timeout(Duration::from_secs(3), waiting)
+            .await
+            .unwrap()?;
+        drop(reserved);
+        assert_eq!(cache.lock().size, 0);
+        root.write().await.truncate_and_sync().await?;
+    }
+    Ok(())
+}
+
+pub(crate) fn root_claimed() {
+    ROOT_GATE.with(|gate| {
+        if let Some((entered, release)) = gate.borrow_mut().take() {
+            entered.send(()).unwrap();
+            release.recv_timeout(Duration::from_secs(3)).unwrap();
+        }
+    });
+}
+
+pub(crate) fn file_registered() -> std::io::Result<()> {
+    let remaining = FAIL_FILE_LOAD.with(|fail| {
+        let remaining = fail.get();
+        fail.set(remaining.saturating_sub(1));
+        remaining
+    });
+    if remaining == 1 {
+        Err(std::io::Error::other("injected metadata-load failure"))
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) async fn cleanup_finished<FE>(cache: &Cache<FE>) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while cache.lock().gc_pending {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cache cleanup did not finish");
+}
+
+#[tokio::test]
+async fn root_claim_excludes_concurrent_overlap_without_blocking_other_roots() -> std::io::Result<()>
+{
+    let path = unique_tmp_dir();
+    std::fs::create_dir(&path)?;
+    let parent = path.join("parent");
+    let child = parent.join("child");
+    let other = path.join("other");
+    std::fs::create_dir_all(&child)?;
+    std::fs::create_dir(&other)?;
+
+    for (first, second) in [(&parent, &parent), (&parent, &child), (&child, &parent)] {
+        let cache = Cache::<Entry>::new(1024, None, 0, Duration::from_secs(3));
+        let (entered, observed) = std::sync::mpsc::sync_channel(1);
+        let (release, released) = std::sync::mpsc::sync_channel(1);
+        let loading = {
+            let cache = cache.clone();
+            let first = first.clone();
+            std::thread::spawn(move || {
+                ROOT_GATE.with(|gate| *gate.borrow_mut() = Some((entered, released)));
+                cache.load(first)
+            })
+        };
+        observed.recv_timeout(Duration::from_secs(3)).unwrap();
+        let error = cache.clone().load(second.clone()).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        let independent = cache.clone().load(other.clone())?;
+        release.send(()).unwrap();
+        let loaded = loading.join().unwrap()?;
+        assert_eq!(cache.lock().roots.len(), 2);
+        drop((loaded, independent));
+    }
+
+    std::fs::remove_dir_all(path)
+}
+
+#[tokio::test]
+async fn failed_load_releases_partial_registrations_and_root_claim() -> std::io::Result<()> {
+    let path = unique_tmp_dir();
+    std::fs::create_dir(&path)?;
+    let failed = path.join("failed");
+    let other = path.join("other");
+    std::fs::create_dir_all(failed.join("first"))?;
+    std::fs::create_dir(failed.join("second"))?;
+    std::fs::create_dir(&other)?;
+    std::fs::write(failed.join("first/value"), b"first")?;
+    std::fs::write(failed.join("second/value"), b"second")?;
+    std::fs::write(other.join("retained"), b"retained")?;
+    let cache = Cache::<Entry>::new(1024, None, 0, Duration::from_secs(3));
+    let independent = cache.clone().load(other.clone())?;
+
+    // One complete child precedes failure in the other, regardless of scan order.
+    FAIL_FILE_LOAD.with(|fail| fail.set(2));
+    let error = cache.clone().load(failed.clone()).unwrap_err();
+    assert_eq!(error.to_string(), "injected metadata-load failure");
+    {
+        let state = cache.lock();
+        assert_eq!(state.roots.as_slice(), std::slice::from_ref(&other));
+        assert_eq!(state.files.iter().count(), 1);
+        assert!(state
+            .files
+            .iter()
+            .any(|(path, _)| path == &other.join("retained")));
+        assert_eq!(state.size, 0);
+    }
+    let loaded = cache.clone().load(failed)?;
+    assert_eq!(cache.lock().files.iter().count(), 3);
+    let absent = path.join("absent");
+    assert_eq!(
+        cache.clone().load(absent.clone()).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+    std::fs::create_dir(&absent)?;
+    let retried = cache.clone().load(absent)?;
+    drop((loaded, independent, retried));
+    std::fs::remove_dir_all(path)
 }

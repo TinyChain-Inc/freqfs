@@ -1,13 +1,11 @@
-use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::{fmt, io};
+use std::{fmt, io, mem};
 
 use async_recursion::async_recursion;
-use ds_ext::OrdHashMap;
-use futures::future;
-use futures::stream::{FuturesUnordered, StreamExt};
+use futures::stream::{self, StreamExt};
 use get_size::GetSize;
 use safecast::AsType;
 use tokio::fs;
@@ -17,7 +15,10 @@ use tokio::sync::{
 use uuid::Uuid;
 
 use super::cache::Cache;
-use super::file::*;
+use super::file::{
+    sync_directory, temporary_name, FileLoad, FileLock, FileReadGuard, FileReadGuardOwned,
+    FileSave, FileWriteGuard, FileWriteGuardOwned,
+};
 use super::Result;
 
 /// A read lock on a directory.
@@ -39,6 +40,14 @@ pub trait DirDeref {
 
     /// Borrow this instance as a [`Self::Entry`]
     fn as_dir(&self) -> &Dir<Self::Entry>;
+}
+
+impl<D: DirDeref> DirDeref for &D {
+    type Entry = D::Entry;
+
+    fn as_dir(&self) -> &Dir<Self::Entry> {
+        (*self).as_dir()
+    }
 }
 
 impl<'a, FE> DirDeref for DirReadGuard<'a, FE> {
@@ -89,64 +98,6 @@ impl<FE> DirDeref for DirWriteGuardOwned<FE> {
     }
 }
 
-/// A type that can be used to look up a directory entry without calling `to_string()`,
-/// to avoid unnecessary heap allocations.
-pub trait Name {
-    fn partial_cmp(&self, key: &str) -> Option<Ordering>;
-}
-
-#[cfg(feature = "id")]
-impl Name for hr_id::Id {
-    fn partial_cmp(&self, key: &str) -> Option<Ordering> {
-        PartialOrd::partial_cmp(self, key)
-    }
-}
-
-impl Name for String {
-    fn partial_cmp(&self, key: &str) -> Option<Ordering> {
-        PartialOrd::partial_cmp(self.as_str(), key)
-    }
-}
-
-impl Name for str {
-    fn partial_cmp(&self, key: &str) -> Option<Ordering> {
-        PartialOrd::partial_cmp(self, key)
-    }
-}
-
-impl Name for Arc<String> {
-    fn partial_cmp(&self, key: &str) -> Option<Ordering> {
-        PartialOrd::partial_cmp((**self).as_str(), key)
-    }
-}
-
-/// Implement [`Name`] for a type which implements [`std::str::FromStr`],
-/// to compare with a key type which dereferences to a [`str`].
-#[macro_export]
-macro_rules! name_from_str {
-    ($t:ty) => {
-        impl $crate::Name for $t {
-            fn partial_cmp(&self, key: &str) -> Option<std::cmp::Ordering> {
-                let key: $t = key.parse().ok()?;
-                std::cmp::PartialOrd::partial_cmp(self, &key)
-            }
-        }
-    };
-}
-
-name_from_str!(u8);
-name_from_str!(u16);
-name_from_str!(u32);
-name_from_str!(u64);
-name_from_str!(u128);
-name_from_str!(usize);
-name_from_str!(i8);
-name_from_str!(i16);
-name_from_str!(i32);
-name_from_str!(i64);
-name_from_str!(i128);
-name_from_str!(uuid::Uuid);
-
 /// A directory entry, either a [`FileLock`] or a sub-[`DirLock`].
 pub enum DirEntry<FE> {
     /// A subdirectory
@@ -193,22 +144,49 @@ impl<FE> DirEntry<FE> {
     }
 }
 
+// Names are native directory entries, never relative or absolute paths.
+fn validate_name(name: &str) -> Result<()> {
+    let mut components = Path::new(name).components();
+    if name.contains('\0')
+        || !matches!(components.next(),
+        Some(std::path::Component::Normal(part)) if part == std::ffi::OsStr::new(name))
+        || components.next().is_some()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected one filename component",
+        ));
+    }
+
+    if temporary_name(name) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "reserved filesystem temporary name",
+        ));
+    }
+
+    Ok(())
+}
+
 /// A filesystem directory
 pub struct Dir<FE> {
     path: PathBuf,
     cache: Arc<Cache<FE>>,
-    contents: OrdHashMap<String, DirEntry<FE>>,
-    deleted: OrdHashMap<String, DirEntry<FE>>,
+    contents: BTreeMap<String, DirEntry<FE>>,
+    deleted: BTreeMap<String, DirEntry<FE>>,
+    removed: bool,
 }
 
 impl<FE: Send + Sync> Dir<FE> {
-    /// Create an initial entry, awaiting admission of its actual retained allocation.
-    pub async fn create_empty_file<F>(&mut self, name: String, contents: F) -> Result<FileLock<FE>>
-    where
-        FE: GetSize + From<F>,
-    {
-        let contents: FE = contents.into();
-        self.create_file::<FE>(name, contents).await
+    fn check_available(&self) -> Result<()> {
+        if self.removed {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "this directory has been deleted",
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     /// Borrow the [`Path`] of this [`Dir`].
@@ -216,13 +194,26 @@ impl<FE: Send + Sync> Dir<FE> {
         self.path.as_path()
     }
 
+    /// The configured active file-operation limit, also used to bound lifecycle work.
+    pub fn max_file_handles(&self) -> usize {
+        self.cache.max_file_handles()
+    }
+
     /// Return `true` if this [`Dir`] has an entry with the given `name`.
-    pub fn contains<Q: Name + fmt::Display + ?Sized>(&self, name: &Q) -> bool {
-        self.contents.bisect(partial_cmp(name)).is_some()
+    pub fn contains(&self, name: &str) -> bool {
+        self.get(name).is_some()
     }
 
     /// Create and return a new subdirectory of this [`Dir`].
     pub fn create_dir(&mut self, name: String) -> Result<DirLock<FE>> {
+        self.check_available()?;
+        validate_name(&name)?;
+
+        self.insert_dir(name)
+    }
+
+    // Public operations validate the name and availability before synchronous insertion.
+    fn insert_dir(&mut self, name: String) -> Result<DirLock<FE>> {
         if self.contains(&name) {
             Err(io::Error::new(io::ErrorKind::AlreadyExists, name))
         } else if self.deleted.contains_key(&name) {
@@ -244,17 +235,14 @@ impl<FE: Send + Sync> Dir<FE> {
 
     /// Create and return a new subdirectory of this [`Dir`] with a unique name.
     pub fn create_dir_unique(&mut self) -> Result<(Uuid, DirLock<FE>)> {
-        let mut uuid = Uuid::new_v4();
-        let mut name = uuid.to_string();
-        while self.contains(&name) {
-            uuid = Uuid::new_v4();
-            name = uuid.to_string();
+        loop {
+            let uuid = Uuid::new_v4();
+            match self.create_dir(uuid.to_string()) {
+                Ok(dir) => return Ok((uuid, dir)),
+                Err(cause) if cause.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(cause) => return Err(cause),
+            }
         }
-
-        let path = self.path.join(name.as_str());
-        let lock = DirLock::new(self.cache.clone(), path);
-        self.contents.insert(name, DirEntry::Dir(lock.clone()));
-        Ok((uuid, lock))
     }
 
     /// Return an [`Iterator`] over the entries in this [`Dir`].
@@ -275,23 +263,27 @@ impl<FE: Send + Sync> Dir<FE> {
 
     /// Return a new subdirectory of this [`Dir`], creating it if it doesn't already exist.
     pub fn get_or_create_dir(&mut self, name: String) -> Result<DirLock<FE>> {
+        self.check_available()?;
+        validate_name(&name)?;
+
         if let Some(dir) = self.get_dir(&name) {
             Ok(dir.clone())
         } else {
-            self.create_dir(name)
+            self.insert_dir(name)
         }
     }
 
-    /// Get the entry with the given `name` from this [`Dir`].
-    pub fn get<Q: Name + ?Sized>(&self, name: &Q) -> Option<&DirEntry<FE>> {
-        self.contents.bisect(partial_cmp(name))
+    /// Get the entry with this exact textual `name` from this [`Dir`].
+    /// Names use lexical ordering without parsing or normalization.
+    pub fn get(&self, name: &str) -> Option<&DirEntry<FE>> {
+        self.contents.get(name)
     }
 
     /// Get the subdirectory with the given `name` from this [`Dir`], if present.
     ///
     /// Also returns `None` if the entry at `name` is a file.
-    pub fn get_dir<Q: Name + ?Sized>(&self, name: &Q) -> Option<&DirLock<FE>> {
-        match self.contents.bisect(partial_cmp(name)) {
+    pub fn get_dir(&self, name: &str) -> Option<&DirLock<FE>> {
+        match self.get(name) {
             Some(DirEntry::Dir(dir_lock)) => Some(dir_lock),
             _ => None,
         }
@@ -300,8 +292,8 @@ impl<FE: Send + Sync> Dir<FE> {
     /// Get the file with the given `name` from this [`Dir`], if present.
     ///
     /// Also returns `None` if the entry at `name` is a directory.
-    pub fn get_file<Q: Name + ?Sized>(&self, name: &Q) -> Option<&FileLock<FE>> {
-        match self.contents.bisect(partial_cmp(name)) {
+    pub fn get_file(&self, name: &str) -> Option<&FileLock<FE>> {
+        match self.get(name) {
             Some(DirEntry::File(file_lock)) => Some(file_lock),
             _ => None,
         }
@@ -329,9 +321,8 @@ impl<FE: Send + Sync> Dir<FE> {
 
     /// Convenience method to lock a file for reading.
     /// Returns a "not found" error if the there is no file with the given `name`.
-    pub async fn read_file<Q, F>(&self, name: &Q) -> Result<FileReadGuard<'_, F>>
+    pub async fn read_file<F>(&self, name: &str) -> Result<FileReadGuard<'_, F>>
     where
-        Q: Name + fmt::Display + ?Sized,
         F: Send + Sync + 'static,
         FE: FileLoad + AsType<F> + From<F>,
     {
@@ -344,9 +335,8 @@ impl<FE: Send + Sync> Dir<FE> {
 
     /// Convenience method to lock a file for reading.
     /// Returns a "not found" error if the there is no file with the given `name`.
-    pub async fn read_file_owned<Q, F>(&self, name: &Q) -> Result<FileReadGuardOwned<FE, F>>
+    pub async fn read_file_owned<F>(&self, name: &str) -> Result<FileReadGuardOwned<FE, F>>
     where
-        Q: Name + fmt::Display + ?Sized,
         F: Send + Sync + 'static,
         FE: FileLoad + AsType<F> + From<F>,
     {
@@ -359,9 +349,8 @@ impl<FE: Send + Sync> Dir<FE> {
 
     /// Convenience method to lock a file for writing.
     /// Returns a "not found" error if the there is no file with the given `name`.
-    pub async fn write_file<Q, F>(&self, name: &Q) -> Result<FileWriteGuard<'_, FE, F>>
+    pub async fn write_file<F>(&self, name: &str) -> Result<FileWriteGuard<'_, FE, F>>
     where
-        Q: Name + fmt::Display + ?Sized,
         F: Send + Sync + 'static,
         FE: FileLoad + AsType<F> + From<F>,
     {
@@ -374,9 +363,8 @@ impl<FE: Send + Sync> Dir<FE> {
 
     /// Convenience method to lock a file for writing.
     /// Returns a "not found" error if the there is no file with the given `name`.
-    pub async fn write_file_owned<Q, F>(&self, name: &Q) -> Result<FileWriteGuardOwned<FE, F>>
+    pub async fn write_file_owned<F>(&self, name: &str) -> Result<FileWriteGuardOwned<FE, F>>
     where
-        Q: Name + fmt::Display + ?Sized,
         F: Send + Sync + 'static,
         FE: FileLoad + AsType<F> + From<F>,
     {
@@ -396,13 +384,9 @@ impl<FE: Send + Sync> Dir<FE> {
     where
         FE: GetSize + From<F>,
     {
-        if temporary_name(&name) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "reserved filesystem temporary name",
-            ));
-        }
-        if self.contains(&name) {
+        self.check_available()?;
+        validate_name(&name)?;
+        if self.contains(&name) || self.deleted.get(&name).is_some_and(DirEntry::is_dir) {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, name));
         }
 
@@ -440,8 +424,10 @@ impl<FE: Send + Sync> Dir<FE> {
             .map(|file| (uuid, file))
     }
 
-    /// Create or overwrite the directory at `name` by copying from `source`,
-    /// without necessarily loading its contents into the cache.
+    /// Copy `source` into an absent child name without necessarily loading its files.
+    /// Conflicting source locks, including self-copy, return `WouldBlock`.
+    /// An accessible source rejects destinations within its own subtree with
+    /// `InvalidInput`. A later error can leave a partial copy.
     #[async_recursion]
     pub async fn copy_dir_from<'a>(
         &'a mut self,
@@ -451,6 +437,8 @@ impl<FE: Send + Sync> Dir<FE> {
     where
         FE: GetSize + Clone,
     {
+        self.check_available()?;
+        validate_name(&name)?;
         if self.contains(&name) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -458,9 +446,18 @@ impl<FE: Send + Sync> Dir<FE> {
             ));
         }
 
-        let source = source.read().await;
+        // Destination access is already exclusive. Never wait for a source
+        // lock while holding it; reciprocal copies would invert their locks.
+        let source = source.try_read()?;
+        source.check_available()?;
+        if self.path.join(&name).starts_with(source.path()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot copy a directory into itself",
+            ));
+        }
 
-        let dir = self.create_dir(name)?;
+        let dir = self.insert_dir(name)?;
 
         {
             let mut dest = dir.try_write()?;
@@ -494,25 +491,30 @@ impl<FE: Send + Sync> Dir<FE> {
     where
         FE: GetSize + Clone,
     {
-        if temporary_name(&name) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "reserved filesystem temporary name",
-            ));
+        self.check_available()?;
+        validate_name(&name)?;
+        if self.deleted.get(&name).is_some_and(DirEntry::is_dir) {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, name));
         }
-        if let Some(file) = self.get_file(&name) {
-            file.overwrite(source).await?; // this will update the size in the cache
-            Ok(file.clone())
-        } else {
-            let path = self.path.join(&name);
-            let lock = FileLock::load(self.cache.clone(), path.clone());
 
-            lock.overwrite(source).await?; // this will update the size in the cache
+        match self.get(&name) {
+            Some(DirEntry::Dir(_)) => Err(io::Error::new(io::ErrorKind::AlreadyExists, name)),
+            Some(DirEntry::File(file)) => {
+                file.overwrite(source).await?;
+                Ok(file.clone())
+            }
+            None => {
+                let path = self.path.join(&name);
+                let lock = FileLock::load(self.cache.clone(), path.clone());
 
-            self.contents.insert(name, DirEntry::File(lock.clone()));
-            self.cache.insert(path, lock.clone(), 0); // so just set the size to zero here
+                lock.overwrite(source).await?; // this will update the size in the cache
 
-            Ok(lock)
+                self.deleted.remove(&name);
+                self.contents.insert(name, DirEntry::File(lock.clone()));
+                self.cache.insert(path, lock.clone(), 0); // so just set the size to zero here
+
+                Ok(lock)
+            }
         }
     }
 
@@ -526,17 +528,14 @@ impl<FE: Send + Sync> Dir<FE> {
     /// Make sure to call [`Dir::sync`] to delete any contents on the filesystem if it's possible for
     /// an new entry with the same name to be created later.
     #[async_recursion]
-    pub async fn delete<'a, Q>(&'a mut self, name: &'a Q) -> bool
-    where
-        Q: Name + Send + Sync + ?Sized,
-    {
-        if let Some((name, entry)) = self.contents.bisect_and_remove(partial_cmp(name)) {
+    pub async fn delete(&mut self, name: &str) -> bool {
+        if let Some((name, entry)) = self.contents.remove_entry(name) {
             #[cfg(feature = "logging")]
             log::trace!("deleting dir entry {name}...");
 
             match &entry {
                 DirEntry::Dir(dir) => dir.truncate().await,
-                DirEntry::File(file) => file.delete(true).await,
+                DirEntry::File(file) => file.delete().await,
             }
 
             self.deleted.insert(name, entry);
@@ -561,6 +560,7 @@ impl<FE: Send + Sync> Dir<FE> {
     where
         FE: FileSave,
     {
+        self.check_available()?;
         self.sync_contents(true).await?;
         // Standalone subtree calls also publish (or remove) this root's entry.
         self.sync_parent().await
@@ -572,8 +572,10 @@ impl<FE: Send + Sync> Dir<FE> {
     where
         FE: FileSave,
     {
+        self.check_available()?;
         self.write_deletions().await?;
         {
+            let _release = self.cache.on_release();
             let _permit = self.cache.acquire_file_handle().await?;
             match sync_directory(&self.path).await {
                 Ok(()) => {
@@ -584,12 +586,14 @@ impl<FE: Send + Sync> Dir<FE> {
                 Err(error) => return Err(error),
             }
         }
+
         self.sync_parent().await?;
         self.deleted.clear();
         Ok(())
     }
 
     async fn sync_parent(&self) -> Result<()> {
+        let _release = self.cache.on_release();
         let _permit = self.cache.acquire_file_handle().await?;
         let mut parent = self.path.parent();
         while let Some(path) = parent {
@@ -599,6 +603,7 @@ impl<FE: Send + Sync> Dir<FE> {
                 Err(error) => return Err(error),
             }
         }
+
         Ok(())
     }
 
@@ -610,11 +615,14 @@ impl<FE: Send + Sync> Dir<FE> {
             match entry {
                 DirEntry::Dir(subdir) => {
                     let subdir = subdir.write().await;
+                    let _release = self.cache.on_release();
+                    let _permit = self.cache.acquire_file_handle().await?;
                     delete_dir(subdir.path()).await?;
                 }
-                DirEntry::File(file) => file.sync().await?,
+                DirEntry::File(file) => file.remove_from_disk().await?,
             }
         }
+
         Ok(())
     }
 
@@ -623,12 +631,15 @@ impl<FE: Send + Sync> Dir<FE> {
     where
         FE: FileSave,
     {
+        self.check_available()?;
         // A declared directory is an entry in its own right, including when empty.
         // Only explicit deletion removes roots or descendants.
         {
+            let _release = self.cache.on_release();
             let _permit = self.cache.acquire_file_handle().await?;
             fs::create_dir_all(&self.path).await?;
         }
+
         self.write_deletions().await?;
         for entry in self.contents.values() {
             match entry {
@@ -642,10 +653,13 @@ impl<FE: Send + Sync> Dir<FE> {
                 }
             }
         }
+
         if durable {
+            let _release = self.cache.on_release();
             let _permit = self.cache.acquire_file_handle().await?;
             sync_directory(&self.path).await?;
         }
+
         self.deleted.clear();
         Ok(())
     }
@@ -660,19 +674,16 @@ impl<FE: Send + Sync> Dir<FE> {
     /// for an new entry with the same name to be created later.
     /// Alternately, call [`Dir::truncate_and_sync`].
     #[async_recursion]
-    pub async fn truncate<'a>(&'a mut self) {
-        let mut deletions = FuturesUnordered::new();
-
-        for (name, entry) in self.contents.drain() {
-            deletions.push(async move {
+    pub async fn truncate(&mut self) {
+        let mut deletions = stream::iter(mem::take(&mut self.contents))
+            .map(|(name, entry)| async move {
                 match &entry {
                     DirEntry::Dir(dir) => dir.truncate().await,
-                    DirEntry::File(file) => file.delete(false).await,
+                    DirEntry::File(file) => file.delete().await,
                 }
-
                 (name, entry)
             })
-        }
+            .buffer_unordered(self.max_file_handles());
 
         while let Some((name, entry)) = deletions.next().await {
             self.deleted.insert(name, entry);
@@ -681,23 +692,23 @@ impl<FE: Send + Sync> Dir<FE> {
 
     /// Delete all entries from this [`Dir`] on the filesystem.
     ///
-    /// **This will cause a deadlock** if there are still active references to the contents
-    /// of this directory, i.e. if a lock cannot be acquired on any child of this [`Dir`]
-    /// (recursively)!
+    /// **This will cause a deadlock** if active references prevent locking children.
     #[async_recursion]
-    pub async fn truncate_and_sync<'a>(&'a mut self) -> Result<()> {
-        let deletes = FuturesUnordered::new();
-
-        for (_name, entry) in self.contents.drain() {
-            deletes.push(async move {
+    pub async fn truncate_and_sync(&mut self) -> Result<()> {
+        self.check_available()?;
+        self.removed = true;
+        stream::iter(mem::take(&mut self.contents).into_values())
+            .map(|entry| async move {
                 match entry {
                     DirEntry::Dir(dir) => dir.truncate().await,
-                    DirEntry::File(file) => file.delete(false).await,
+                    DirEntry::File(file) => file.delete().await,
                 }
             })
-        }
-
-        deletes.fold((), |(), ()| future::ready(())).await;
+            .buffer_unordered(self.max_file_handles())
+            .fold((), |(), ()| std::future::ready(()))
+            .await;
+        let _release = self.cache.on_release();
+        let _permit = self.cache.acquire_file_handle().await?;
         delete_dir(self.path()).await
     }
 }
@@ -726,8 +737,9 @@ impl<FE: Send + Sync> DirLock<FE> {
         let dir = Dir {
             path,
             cache,
-            contents: OrdHashMap::new(),
-            deleted: OrdHashMap::new(),
+            contents: BTreeMap::new(),
+            deleted: BTreeMap::new(),
+            removed: false,
         };
 
         Self {
@@ -740,44 +752,59 @@ impl<FE: Send + Sync> DirLock<FE> {
         #[cfg(feature = "logging")]
         log::trace!("load cached dir at {}", path.display());
 
-        let mut contents = OrdHashMap::new();
-        let mut abandoned = OrdHashMap::new();
+        let mut contents = BTreeMap::new();
+        let mut abandoned = BTreeMap::new();
+
         // freqfs is the filesystem owner: this is the one-time canonical scan
         // which constructs the cache before its handles are published.
         let handles = std::fs::read_dir(&path)?;
 
-        for handle in handles {
-            let handle = handle?;
+        let loaded = (|| -> Result<()> {
+            for handle in handles {
+                let handle = handle?;
 
-            let name = handle.file_name().into_string().map_err(|os_str| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("OS string is not valid Unicode: {:?}", os_str),
-                )
-            })?;
+                let name = handle.file_name().into_string().map_err(|os_str| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("OS string is not valid Unicode: {:?}", os_str),
+                    )
+                })?;
 
-            #[cfg(feature = "logging")]
-            log::trace!("loading cached dir entry {name}...");
+                #[cfg(feature = "logging")]
+                log::trace!("loading cached dir entry {name}...");
 
-            let meta = handle.metadata()?;
+                let meta = handle.metadata()?;
 
-            if meta.is_dir() {
-                let subdirectory = Self::load(cache.clone(), handle.path())?;
-                contents.insert(name, DirEntry::Dir(subdirectory));
-            } else if meta.is_file() {
-                if temporary_name(&name) {
-                    abandoned.insert(
-                        name,
-                        DirEntry::File(FileLock::abandoned(cache.clone(), handle.path())),
-                    );
-                    continue;
+                if meta.is_dir() {
+                    let subdirectory = Self::load(cache.clone(), handle.path())?;
+                    contents.insert(name, DirEntry::Dir(subdirectory));
+                } else if meta.is_file() {
+                    if temporary_name(&name) {
+                        abandoned.insert(
+                            name,
+                            DirEntry::File(FileLock::abandoned(cache.clone(), handle.path())),
+                        );
+                        continue;
+                    }
+
+                    let file = FileLock::load(cache.clone(), handle.path());
+                    cache.insert(handle.path(), file.clone(), 0);
+                    contents.insert(name, DirEntry::File(file));
+                    #[cfg(test)]
+                    crate::cache::tests::file_registered()?;
+                } else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("{:?} is neither a directory nor a file", handle.path()),
+                    ));
                 }
-                let file = FileLock::load(cache.clone(), handle.path());
-                cache.insert(handle.path(), file.clone(), 0);
-                contents.insert(name, DirEntry::File(file));
-            } else {
-                unreachable!("{:?} is neither a directory nor a file", handle.path());
             }
+
+            Ok(())
+        })();
+        if let Err(cause) = loaded {
+            Self::discard_unpublished(contents, &cache);
+            return Err(cause);
         }
 
         let dir = Dir {
@@ -785,10 +812,27 @@ impl<FE: Send + Sync> DirLock<FE> {
             cache,
             contents,
             deleted: abandoned,
+            removed: false,
         };
 
         let inner = Arc::new(RwLock::new(dir));
         Ok(DirLock { state: inner })
+    }
+
+    // Unpublished directories have no external owners or resident payloads.
+    // Walk only the failed subtree; unrelated roots keep their cache entries.
+    fn discard_unpublished(contents: BTreeMap<String, DirEntry<FE>>, cache: &Cache<FE>) {
+        for entry in contents.into_values() {
+            match entry {
+                DirEntry::Dir(dir) => {
+                    let dir = Arc::into_inner(dir.state)
+                        .expect("unpublished directory has one owner")
+                        .into_inner();
+                    Self::discard_unpublished(dir.contents, cache);
+                }
+                DirEntry::File(file) => cache.remove(&file.path().to_owned(), 0),
+            }
+        }
     }
 
     /// Lock this directory for reading.
@@ -883,28 +927,26 @@ impl<FE: Send + Sync> DirLock<FE> {
     where
         FE: Send + Sync,
     {
-        let mut entries = self
-            .try_write()
-            .map_err(|cause| io::Error::new(io::ErrorKind::WouldBlock, cause))?;
+        let mut entries = self.try_write()?;
+        entries.check_available()?;
 
         #[cfg(feature = "logging")]
         log::trace!("trim directory {}", entries.path().display());
 
-        let mut sizes = Vec::with_capacity(entries.len());
+        let mut empty = Vec::new();
         for (name, entry) in entries.iter() {
             match entry {
                 DirEntry::Dir(dir) => {
-                    let size = dir.trim().await?;
-                    sizes.push((name.clone(), size));
+                    if dir.trim().await? == 0 {
+                        empty.push(name.clone());
+                    }
                 }
                 DirEntry::File(_) => {}
             }
         }
 
-        for (name, size) in sizes {
-            if size == 0 {
-                entries.delete(&name).await;
-            }
+        for name in empty {
+            entries.delete(&name).await;
         }
 
         Ok(entries.len())
@@ -916,6 +958,7 @@ impl<FE: Send + Sync> DirLock<FE> {
         FE: Send + Sync,
     {
         let mut state = self.state.write().await;
+        state.removed = true;
         state.truncate().await
     }
 }
@@ -932,14 +975,6 @@ async fn delete_dir(path: &Path) -> Result<()> {
         Err(cause) if cause.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(cause) => Err(cause),
     }
-}
-
-#[inline]
-fn partial_cmp<'a, Q>(name: &'a Q) -> impl Fn(&String) -> Option<Ordering> + Copy + 'a
-where
-    Q: Name + ?Sized,
-{
-    |key| Name::partial_cmp(name, key.as_str())
 }
 
 #[cfg(test)]

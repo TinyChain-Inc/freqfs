@@ -22,6 +22,14 @@ struct Data {
     pause: Option<Arc<tokio::sync::Notify>>,
     fail: bool,
     unlink: Option<PathBuf>,
+    error: Option<fn() -> std::io::Error>,
+    observation: Option<Arc<SaveObservation>>,
+}
+
+#[derive(Default)]
+struct SaveObservation {
+    attempts: std::sync::atomic::AtomicUsize,
+    changed: tokio::sync::Notify,
 }
 
 impl Data {
@@ -31,6 +39,8 @@ impl Data {
             pause: None,
             fail: false,
             unlink: None,
+            error: None,
+            observation: None,
         }
     }
 }
@@ -69,12 +79,23 @@ impl FileLoad for Data {
             pause: None,
             fail: false,
             unlink: None,
+            error: None,
+            observation: None,
         })
     }
 }
 
 impl FileSave for Data {
     async fn save(&self, file: &mut fs::File) -> crate::Result<u64> {
+        if let Some(observation) = &self.observation {
+            observation
+                .attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            observation.changed.notify_one();
+        }
+        if let Some(error) = self.error {
+            return Err(error());
+        }
         file.write_all(&self.bytes).await?;
         if let Some(path) = &self.unlink {
             fs::remove_file(path).await?;
@@ -88,6 +109,180 @@ impl FileSave for Data {
         }
         Ok(self.bytes.len() as u64)
     }
+}
+
+#[derive(Debug)]
+struct SaveError;
+
+impl std::fmt::Display for SaveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("typed save failure")
+    }
+}
+
+impl std::error::Error for SaveError {}
+
+fn marked_save_error() -> std::io::Error {
+    crate::IntegrityError::invalid_data(SaveError)
+}
+
+fn native_save_error() -> std::io::Error {
+    std::io::Error::from_raw_os_error(13)
+}
+
+fn assert_save_error(error: &std::io::Error, marked: bool) {
+    assert_eq!(crate::IntegrityError::is_marked(error), marked);
+    if marked {
+        let marker = error.get_ref().unwrap();
+        let cause = marker
+            .source()
+            .unwrap()
+            .downcast_ref::<std::io::Error>()
+            .unwrap();
+        assert!(cause.get_ref().unwrap().is::<SaveError>());
+    } else {
+        assert_eq!(error.raw_os_error(), Some(13));
+    }
+}
+
+#[tokio::test]
+async fn writeback_preserves_typed_and_native_errors() -> crate::Result<()> {
+    for (fault, marked) in [
+        (marked_save_error as fn() -> std::io::Error, true),
+        (native_save_error, false),
+    ] {
+        let path = unique_tmp_dir();
+        fs::create_dir(&path).await?;
+        let cache = crate::Cache::<Data>::new(1, Some(1), 0, std::time::Duration::from_secs(3));
+        let root = cache.clone().load(path)?;
+        let mut payload = Data::new(&[1]);
+        payload.error = Some(fault);
+        let file = root
+            .write()
+            .await
+            .create_file("fault".into(), payload)
+            .await?;
+        assert_save_error(&file.sync().await.unwrap_err(), marked);
+        assert_save_error(&file.sync_all().await.unwrap_err(), marked);
+        assert_save_error(
+            &file.cached().evict(&cache).unwrap().1.await.unwrap_err(),
+            marked,
+        );
+        assert_save_error(&cache.reserve(1).await.err().unwrap(), marked);
+        drop(cache.try_acquire_file_handle()?);
+        assert_eq!(&file.read::<Data>().await?.bytes, &[1]);
+        root.write().await.truncate_and_sync().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn cold_copy_respects_disk_reserve_before_mutation() -> crate::Result<()> {
+    let path = unique_tmp_dir();
+    fs::create_dir(&path).await?;
+    fs::write(path.join("source"), [7]).await?;
+    fs::write(path.join("destination"), [3]).await?;
+    let root = crate::Cache::<Data>::new(64, Some(1), u64::MAX, std::time::Duration::from_secs(3))
+        .load(path.clone())?;
+    let source = root.read().await.get_file("source").unwrap().clone();
+    for name in ["destination", "absent"] {
+        assert_eq!(
+            root.write()
+                .await
+                .copy_file_from(name.into(), &source)
+                .await
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::StorageFull
+        );
+    }
+    assert_eq!(fs::read(path.join("destination")).await?, [3]);
+    assert!(!path.join("absent").exists());
+    assert!(!root.read().await.contains("absent"));
+    root.write().await.truncate_and_sync().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn synchronization_and_eviction_share_one_admission_limit() -> crate::Result<()> {
+    use futures::FutureExt;
+
+    let path = unique_tmp_dir();
+    fs::create_dir(&path).await?;
+    let cache = crate::Cache::<Data>::new(64, Some(1), 0, std::time::Duration::from_secs(3));
+    let root = cache.clone().load(path)?;
+    let first_started = Arc::new(tokio::sync::Notify::new());
+    let second_started = Arc::new(tokio::sync::Notify::new());
+    let mut a = Data::new(&[1]);
+    a.pause = Some(first_started.clone());
+    let mut b = Data::new(&[2]);
+    b.pause = Some(second_started.clone());
+    let first = root.write().await.create_file("first".into(), a).await?;
+    let second = root.write().await.create_file("second".into(), b).await?;
+    let mut initial = Box::pin(first.sync());
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        tokio::select! {
+            _ = first_started.notified() => {}
+            result = &mut initial => panic!("expected blocked save, got {result:?}"),
+        }
+    })
+    .await
+    .unwrap();
+    assert!(cache.try_acquire_file_handle().is_err());
+    assert!(second.cached().evict(&cache).is_none());
+    let mut waiting = Box::pin(second.sync_all());
+    assert!(futures::poll!(&mut waiting).is_pending());
+    assert!(second_started.notified().now_or_never().is_none());
+    drop(initial);
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        tokio::select! {
+            _ = second_started.notified() => {}
+            result = &mut waiting => panic!("expected blocked second save, got {result:?}"),
+        }
+    })
+    .await
+    .unwrap();
+    assert!(cache.try_acquire_file_handle().is_err());
+    drop(waiting);
+    drop(cache.try_acquire_file_handle()?);
+    assert!(first.state.try_write().is_ok());
+    assert!(second.state.try_write().is_ok());
+    root.write().await.truncate_and_sync().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_oversized_eviction_stops_until_new_demand() -> crate::Result<()> {
+    use std::sync::atomic::Ordering;
+
+    let path = unique_tmp_dir();
+    fs::create_dir(&path).await?;
+    let cache = crate::Cache::<Data>::new(1, Some(1), 0, std::time::Duration::from_secs(3));
+    let root = cache.clone().load(path)?;
+    let observation = Arc::new(SaveObservation::default());
+    let mut data = Data::new(&[1]);
+    data.error = Some(marked_save_error);
+    data.observation = Some(observation.clone());
+    let file = root.write().await.create_file("grown".into(), data).await?;
+    file.write::<Data>().await?.bytes = vec![1, 2];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        observation.changed.notified(),
+    )
+    .await
+    .unwrap();
+    crate::cache::tests::cleanup_finished(&cache).await;
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(observation.attempts.load(Ordering::SeqCst), 1);
+    assert_save_error(&cache.reserve(1).await.err().unwrap(), true);
+    assert_eq!(observation.attempts.load(Ordering::SeqCst), 1);
+    assert_save_error(&cache.reserve(1).await.err().unwrap(), true);
+    assert_eq!(observation.attempts.load(Ordering::SeqCst), 2);
+    drop(cache.try_acquire_file_handle()?);
+    root.write().await.truncate_and_sync().await?;
+    Ok(())
 }
 
 async fn overwrite_files(
@@ -221,7 +416,7 @@ async fn buffered_writeback_and_eviction_have_no_durability_barriers() -> crate:
         .await?;
     root.sync().await?;
     *file.write::<Data>().await? = Data::new(b"new");
-    file.clone().evict().unwrap().1.await?;
+    file.cached().evict(&file.cache).unwrap().1.await?;
     assert!(file.contents.try_read().unwrap().is_none());
     assert_eq!(fs::read(path.join("data")).await?, b"new");
     fs::remove_dir_all(path).await?;
@@ -243,13 +438,23 @@ async fn pending_readers_observe_released_eviction_contents() -> crate::Result<(
         .await?;
     file.sync().await?;
     for _ in 0..256 {
-        let eviction = file.clone().evict().unwrap().1;
+        let eviction = file.cached().evict(&file.cache).unwrap().1;
         let reader = file.read::<Data>();
         futures::pin_mut!(reader);
         assert!(reader.as_mut().now_or_never().is_none());
         let eviction = tokio::spawn(eviction);
-        assert_eq!(reader.await?.bytes, b"old");
+        let read = reader.await?;
+        assert_eq!(read.bytes, b"old");
         eviction.await.unwrap()?;
+        // Keep the loaded value pinned until any pressure-triggered cleanup ends,
+        // so the next manual eviction does not compete with the cache worker.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            crate::cache::tests::cleanup_finished(&file.cache),
+        )
+        .await
+        .unwrap();
+        drop(read);
     }
     // Eviction failure or cancellation retains the resident data and state.
     for failure in [true, false] {
@@ -258,7 +463,7 @@ async fn pending_readers_observe_released_eviction_contents() -> crate::Result<(
         replacement.fail = failure;
         replacement.pause = (!failure).then(|| Arc::clone(&started));
         *file.write::<Data>().await? = replacement;
-        let eviction = file.clone().evict().unwrap().1;
+        let eviction = file.cached().evict(&file.cache).unwrap().1;
         if failure {
             assert!(eviction.await.is_err());
         } else {
@@ -294,7 +499,7 @@ async fn reopening_defers_abandoned_replacement_cleanup() -> crate::Result<()> {
     assert!(dir
         .write()
         .await
-        .create_empty_file("reserved._freqfs".into(), Data::new(b"bad"))
+        .create_file("reserved._freqfs".into(), Data::new(b"bad"))
         .await
         .is_err());
     dir.sync_deleted().await?;
@@ -316,12 +521,12 @@ async fn explicit_durable_sync_covers_eviction_and_repeated_calls() -> crate::Re
         .create_file("data".into(), Data::new(b"old"))
         .await?;
     file.sync().await?;
-    file.clone().evict().unwrap().1.await?;
+    file.cached().evict(&file.cache).unwrap().1.await?;
     assert!(matches!(*file.state.read().await, FileLockState::Pending));
     file.sync_all().await?;
     file.sync_all().await?;
     *file.write::<Data>().await? = Data::new(b"new");
-    file.clone().evict().unwrap().1.await?;
+    file.cached().evict(&file.cache).unwrap().1.await?;
     root.sync_all().await?;
     assert_eq!(fs::read(path.join("data")).await?, b"new");
     root.write().await.delete("data").await;
@@ -463,9 +668,17 @@ async fn durable_replacement_failure_probe(position: usize) -> crate::Result<()>
     let root = cache.load(path.clone())?;
     let file = root.read().await.get_file("data").unwrap().clone();
     let error = file.replace_all(Data::new(b"new")).await.unwrap_err();
-    assert_eq!(error.raw_os_error(), Some(5), "expected Linux EIO: {error}");
+    assert!(crate::IntegrityError::is_marked(&error));
+    let cause = error
+        .get_ref()
+        .unwrap()
+        .source()
+        .unwrap()
+        .downcast_ref::<std::io::Error>()
+        .unwrap();
+    assert_eq!(cause.raw_os_error(), Some(5), "expected Linux EIO: {error}");
     assert!(file.read::<Data>().await.is_err());
-    assert!(file.clone().evict().is_none());
+    assert!(file.cached().evict(&file.cache).is_none());
     let contents = fs::read(path.join("data")).await?;
     assert_eq!(contents, if position == 1 { b"old" } else { b"new" });
     let reopened = crate::Cache::<Data>::new(1024, None, 0, std::time::Duration::from_secs(1))
@@ -526,16 +739,28 @@ async fn durable_replacement_excludes_eviction_and_fails_closed() -> crate::Resu
             });
             started.notified().await;
             assert_eq!(Arc::strong_count(&started), 2);
-            assert!(file.clone().evict().is_none());
+            assert!(file.cached().evict(&file.cache).is_none());
             task.abort();
             assert!(task.await.unwrap_err().is_cancelled());
         } else {
-            assert!(file.replace_all(replacement).await.is_err());
+            let error = file.replace_all(replacement).await.unwrap_err();
+            assert!(crate::IntegrityError::is_marked(&error));
         }
-        assert!(file.clone().evict().is_none());
-        assert!(file.read::<Data>().await.is_err());
-        assert!(file.write::<Data>().await.is_err());
-        assert!(file.sync_all().await.is_err());
+        assert!(file.cached().evict(&file.cache).is_none());
+        assert!(crate::IntegrityError::is_marked(
+            &file.read::<Data>().await.err().expect("invalidated read")
+        ));
+        assert!(crate::IntegrityError::is_marked(
+            &file.write::<Data>().await.err().expect("invalidated write")
+        ));
+        assert!(crate::IntegrityError::is_marked(
+            &file.sync_all().await.unwrap_err()
+        ));
+        assert_eq!(fs::read(path.join("data")).await?, b"old");
+        assert!(root.write().await.delete("data").await);
+        assert!(crate::IntegrityError::is_marked(
+            &root.sync_deleted().await.unwrap_err()
+        ));
         assert_eq!(fs::read(path.join("data")).await?, b"old");
         fs::remove_dir_all(path).await?;
     }
@@ -580,5 +805,75 @@ async fn persist_does_not_corrupt_existing_file_on_save_error() -> std::io::Resu
     assert!(!path.with_extension("txt_freqfs").exists());
 
     let _ = fs::remove_dir_all(&tmp).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn truncation_bounds_admitted_children_and_releases_cancelled_waits() -> crate::Result<()> {
+    for synchronize in [false, true] {
+        let path = unique_tmp_dir();
+        std::fs::create_dir(&path)?;
+        let cache = crate::Cache::<Data>::new(1024, Some(2), 0, std::time::Duration::from_secs(3));
+        let root = cache.clone().load(path.clone())?;
+        let mut files = Vec::new();
+        {
+            let mut dir = root.write().await;
+            assert_eq!(dir.max_file_handles(), 2);
+            for i in 0..5 {
+                files.push(dir.create_file(i.to_string(), Data::new(&[1])).await?);
+            }
+        }
+        let mut retained = Vec::new();
+        for file in &files {
+            retained.push(file.state.clone().read_owned().await);
+        }
+        let mut dir = root.write().await;
+        let mut truncation = Box::pin(async {
+            if synchronize {
+                dir.truncate_and_sync().await
+            } else {
+                dir.truncate().await;
+                Ok(())
+            }
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            std::future::poll_fn(
+                |cx| match std::future::Future::poll(truncation.as_mut(), cx) {
+                    std::task::Poll::Pending
+                        if files
+                            .iter()
+                            .filter(|file| file.state.try_read().is_err())
+                            .count()
+                            == 2 =>
+                    {
+                        std::task::Poll::Ready(())
+                    }
+                    std::task::Poll::Pending => std::task::Poll::Pending,
+                    std::task::Poll::Ready(result) => {
+                        panic!("expected blocked truncation: {result:?}")
+                    }
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            files
+                .iter()
+                .filter(|file| file.state.try_read().is_err())
+                .count(),
+            2
+        );
+        drop(truncation);
+        assert!(files.iter().all(|file| file.state.try_read().is_ok()));
+        let first = cache.try_acquire_file_handle()?;
+        let second = cache.try_acquire_file_handle()?;
+        assert!(cache.try_acquire_file_handle().is_err());
+        drop((first, second));
+        drop(dir);
+        drop((retained, files, root, cache));
+        std::fs::remove_dir_all(path)?;
+    }
     Ok(())
 }

@@ -8,7 +8,7 @@ use safecast::as_type;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
-use freqfs::*;
+use freqfs::{Cache, DirLock, FileReadGuard, FileWriteGuard};
 
 #[derive(Clone)]
 enum File {

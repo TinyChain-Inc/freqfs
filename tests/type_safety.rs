@@ -5,7 +5,7 @@ use destream::{de, en};
 use safecast::as_type;
 use tokio::fs;
 
-use freqfs::*;
+use freqfs::Cache;
 
 #[derive(Clone)]
 enum File {
@@ -77,9 +77,17 @@ async fn wrong_type_read_returns_invalid_data() -> Result<(), io::Error> {
 
     let err = file.read::<String>().await.unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert!(
+        !freqfs::IntegrityError::is_marked(&err),
+        "a caller type mismatch is not stored corruption"
+    );
 
     let err = file.write::<String>().await.unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert!(
+        !freqfs::IntegrityError::is_marked(&err),
+        "a caller type mismatch is not stored corruption"
+    );
 
     file.sync().await?;
     drop(file);
@@ -175,4 +183,24 @@ async fn paused_cached_reader_does_not_block_another_reader() -> Result<(), io::
     }
     fs::remove_dir_all(path).await?;
     Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unsupported_filesystem_entries_return_errors() -> io::Result<()> {
+    let path = setup_tmp_dir().await?;
+    let socket = std::os::unix::net::UnixListener::bind(path.join("socket"))?;
+    let cache = Cache::<File>::new(4096, None, 0, std::time::Duration::from_secs(3));
+    let error = cache
+        .clone()
+        .load(path.clone())
+        .expect_err("unsupported filesystem entry");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("neither a directory nor a file"));
+    drop(socket);
+    fs::remove_file(path.join("socket")).await?;
+    let directory = cache.clone().load(path.clone())?;
+    drop(directory);
+    drop(cache);
+    fs::remove_dir_all(path).await
 }

@@ -1,8 +1,8 @@
 ## How to Contribute
 
 We're excited to accept your contributions to freqfs! If you're not sure where to get started,
-consider [starting a discussion](https://github.com/haydnv/tinychain/discussions)
-or [creating an issue](https://github.com/haydnv/tinychain/issues).
+consider [starting a discussion](https://github.com/TinyChain-Inc/tinychain/discussions)
+or [creating an issue](https://github.com/TinyChain-Inc/tinychain/issues).
 
 If you already have some changes you'd like to submit, just send a pull request.
 You can find instructions for creating a pull request in

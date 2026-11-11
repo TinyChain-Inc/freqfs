@@ -4,7 +4,7 @@ version = "0.13.0"
 authors = ["code@tinychain.net"]
 edition = "2021"
 license = "Apache-2.0"
-description = "An in-memory filesystem cache layer over tokio::fs, with LFU eviction"
+description = "An in-memory filesystem cache layer over tokio::fs, with incremental cache promotion"
 repository = "https://github.com/TinyChain-Inc/freqfs.git"
 readme = "README.md"
 
@@ -15,17 +15,14 @@ keywords = ["file", "io", "cache"]
 name = "example"
 
 [features]
-all = ["id", "logging"]
-id = ["hr-id"]
+all = ["logging"]
 logging = ["log"]
 
 [dependencies]
 async-recursion = "1.1"
-ds-ext = { path = "../ds-ext", version = "0.4" }
 futures = "0.3"
 get-size = "0.1"
 fs2 = "0.4"
-hr-id = { path = "../hr-id", version = "0.7.0", optional = true }
 log = { version = "0.4", optional = true }
 safecast = "0.2"
 tokio = { version = "1.39", features = ["fs", "io-util", "rt-multi-thread", "sync", "time"] }

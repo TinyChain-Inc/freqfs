@@ -5,7 +5,7 @@ use destream::{de, en};
 use safecast::as_type;
 use tokio::fs;
 
-use freqfs::*;
+use freqfs::{Cache, FileReadGuard};
 
 #[derive(Clone)]
 enum File {
