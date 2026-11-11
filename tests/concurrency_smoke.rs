@@ -8,7 +8,7 @@ use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tokio::task::JoinSet;
 
-use freqfs::*;
+use freqfs::{Cache, FileReadGuard, FileWriteGuard};
 
 #[derive(Clone)]
 enum File {

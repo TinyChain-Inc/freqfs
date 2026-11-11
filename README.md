@@ -1,7 +1,15 @@
 # freqfs
-An in-memory filesystem cache layer based on tokio::fs, with least-frequently-used eviction
+An in-memory filesystem cache layer based on tokio::fs, with one-position cache promotion per hit
 
 Roadmap and planning notes are tracked in `ROADMAP.md`.
+
+Cache entries start at the front. Each hit moves an entry one position toward
+the front; eviction scans from the back. Removal preserves the order of the
+remaining entries. This policy is neither exact LFU nor LRU.
+The private cache priority map owns this ordering; it is not a public collection
+API. Its borrowed cursors do not retain keys, and mutation uses exclusive access
+under the existing cache mutex. The implementation is adapted from ds-ext under
+the Apache-2.0 license and requires Rust 1.86 or newer for disjoint map access.
 
 `sync()` writes cached changes to the filesystem without forcing durability.
 Dirty eviction uses the same buffered writeback. Neither acknowledges survival
@@ -16,8 +24,8 @@ file contents, including unchanged files. No separate durability-dirty state is
 maintained: the persistence owner selects when and what to synchronize.
 The caller supplies durably established cache roots and coordinates concurrent
 mutations. Synchronize from the containing root when publishing multiple new
-directory levels. A file modified during synchronization returns an error rather than
-acknowledging unsynchronized contents.
+directory levels. Durable file synchronization retains exclusive state access
+through writeback and the durability barriers; concurrent writers wait.
 
 `Dir::sync_deleted()` (also available on `DirLock`) applies pending deletions and
 durably synchronizes their containing directory. It retains that directory and
@@ -52,6 +60,67 @@ power-loss tests.
 Memory-mapped file I/O support is deferred planning described in `ROADMAP.md`.
 Any implementation must satisfy this repository's atomicity, backpressure,
 portability, and performance gates.
+
+## Directory names
+
+Directory lookup and deletion borrow exact textual names as `&str`. Their
+lexical comparison matches the directory index: `"2"` and `"02"` are distinct,
+and UUID spelling is not normalized. Borrow existing strings or IDs directly;
+format typed identifiers into caller-owned stack buffers before lookup. Only
+insertion needs an owned name. Existing filenames are unchanged.
+
+Creation and copying accept one native filename component, never a path. Empty
+names, `.`, `..`, absolute paths, separators, and NUL bytes reject with
+`InvalidInput` before publication or mutation. File replacement temporary names
+retain their existing reservation.
+
+Directories use the standard ordered map for membership and pending deletions.
+File creation and copying reject directory destinations, including directories
+awaiting deletion, with `AlreadyExists`. Complete deletion with `sync()` or
+`sync_deleted()` before reusing a directory name for a file. Copying over an
+existing file remains supported; rejected copies preserve pending cleanup.
+
+The containing directory owns pending native removals until synchronization
+succeeds. `truncate()` retains that directory while removing its entries;
+synchronization completes their native removal before reopening. Deleted file
+handles return `NotFound` from `sync()` and `sync_all()`, including after their
+name is reused. Retaining an old handle grants no authority over its replacement.
+Cleanup tolerates already-absent files on retry and preserves integrity errors
+from invalidated file ownership.
+
+Deleted directory handles retain metadata access but cannot create, copy,
+synchronize, or trim entries: these operations return `NotFound`, including
+after the same name is reused. Removing a directory invalidates its descendants.
+Ordinary truncation leaves the containing directory usable;
+`truncate_and_sync` removes it and invalidates that handle.
+
+Directory copying never waits for a conflicting source lock while holding its
+destination. It returns `WouldBlock` instead. Copying into the source's own
+subtree rejects before mutation. A later failure may leave a partial destination;
+the caller retains responsibility for interrupted mutations.
+
+`Cache::load` claims its root before scanning metadata. Concurrent overlapping
+loads are rejected while unrelated roots can load independently. A returned load
+error discards unpublished cache entries and releases the claim for retry.
+Root-path comparison remains textual; callers coordinate path aliases and
+separate cache instances.
+
+`Dir::max_file_handles()` exposes the configured cache-wide admission limit.
+File and directory creation and copying share the filename validator, including
+the reservation of writeback temporary names. Rejection precedes admission or
+source locking. Exact lookup and startup inspection of existing entries are
+unchanged.
+Directory truncation admits at most that many child futures per pass. This
+bounds pending lifecycle work, not total memory across concurrent callers.
+Loading, copying, writeback, and synchronization share one file-operation
+semaphore. Cached read/write guards pin memory through their locks, not OS file
+descriptors or I/O capacity. Clean eviction needs no I/O permit; prepared
+evictions remain bounded by the configured limit. Completed load I/O releases
+admission before waiting for memory capacity and returns a cached guard without
+reacquiring it. Replacement and resident-copy memory waits likewise hold no
+file-operation permit, allowing eviction to make progress.
+Cancellation releases guards and permits but can leave partially applied changes;
+the caller owns cleanup and safe reuse after interrupted mutations.
 
 ## Filesystem codecs
 
@@ -99,5 +168,28 @@ discard unused in-memory container capacity.
 
 The eviction worker keeps a weak cache reference while idle. Cache entries retain
 payload state without retaining their owning cache; owned guards keep the cache
-alive for exactly their lifetime. Eviction failures retain the original I/O error
-kind and message for the next admission attempt.
+alive for exactly their lifetime. Borrowed write guards borrow their cache and
+do not increment its reference count. Eviction failures retain the original I/O error
+and its typed causes for the next admission attempt. Uncached copies enforce the
+same free-disk threshold as writeback. Save and native filesystem errors propagate
+without conversion to diagnostic strings, preserving local integrity provenance.
+
+An empty eviction pass does not repeatedly wake admission. Releasing capacity,
+guards, or permits signals progress after the relevant resources are released.
+A failed pass stops automatic retry and retains its error; a later admission
+reports that error, and fresh demand can request another pass. Cache pressure,
+pending cleanup, and retained errors share the existing bookkeeping mutex.
+
+Unsupported filesystem entries return `InvalidData`; loading never treats them
+as files or silently skips them. Poisoned cache bookkeeping is an invariant failure
+and panics; it is not an ordinary I/O error. Callers must stop using the cache after such a failure.
+The application owns termination and recovery policy, including the panic
+strategy of its tasks. This library does not explicitly terminate the host.
+
+### Storage integrity errors
+
+`IntegrityError` preserves native I/O kinds and causes while identifying detected
+stored-data inconsistency or invalidated file ownership. Libraries return these
+errors; their caller decides whether to stop the application and recover. Input
+validation and ordinary I/O failures do not acquire this marker. Poisoned
+bookkeeping remains an invariant panic, under the application's panic strategy.

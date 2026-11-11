@@ -1,5 +1,6 @@
-use rand::Rng;
 use std::path::PathBuf;
+
+use rand::Rng;
 use tokio::fs;
 
 use freqfs::{FileLoad, FileSave};

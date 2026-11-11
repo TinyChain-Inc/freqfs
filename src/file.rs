@@ -4,17 +4,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{fmt, io};
 
-use futures::{Future, TryFutureExt};
+use futures::Future;
 use get_size::GetSize;
 use safecast::AsType;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{
-    OwnedRwLockReadGuard, OwnedRwLockWriteGuard, OwnedSemaphorePermit, RwLock, RwLockReadGuard,
-    RwLockWriteGuard,
+    OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
 };
 
-use super::cache::Cache;
+use super::cache::{BorrowedRelease, Cache, OwnedRelease, Release};
 use super::Result;
 
 const TMP: &str = "_freqfs";
@@ -28,7 +27,9 @@ pub(crate) fn temporary_name(name: &str) -> bool {
 }
 
 fn interrupted() -> io::Error {
-    io::Error::other("file ownership invalidated; reopen the cache")
+    crate::IntegrityError::mark(io::Error::other(
+        "file ownership invalidated; reopen the cache",
+    ))
 }
 
 pub(crate) async fn sync_directory(path: &Path) -> Result<()> {
@@ -37,32 +38,29 @@ pub(crate) async fn sync_directory(path: &Path) -> Result<()> {
 
 pub struct FileReadGuard<'a, F> {
     guard: RwLockReadGuard<'a, F>,
-    _permit: OwnedSemaphorePermit,
+    _release: BorrowedRelease<'a>,
 }
 
 pub struct FileReadGuardOwned<FE, F> {
     guard: OwnedRwLockReadGuard<Option<FE>, F>,
-    _cache: Arc<Cache<FE>>,
-    _permit: OwnedSemaphorePermit,
+    _cache: OwnedRelease<FE>,
 }
 
 /// A mutable payload. Dropping the guard accounts its actual retained allocation.
 pub struct FileWriteGuard<'a, FE: GetSize, F> {
     guard: RwLockWriteGuard<'a, Option<FE>>,
     state: RwLockWriteGuard<'a, FileLockState>,
-    cache: Arc<Cache<FE>>,
     previous: usize,
     _payload: PhantomData<F>,
-    _permit: OwnedSemaphorePermit,
+    cache: Release<&'a Cache<FE>>,
 }
 
 pub struct FileWriteGuardOwned<FE: GetSize, F> {
     guard: OwnedRwLockWriteGuard<Option<FE>>,
     state: OwnedRwLockWriteGuard<FileLockState>,
-    cache: Arc<Cache<FE>>,
     previous: usize,
     _payload: PhantomData<F>,
-    _permit: OwnedSemaphorePermit,
+    cache: OwnedRelease<FE>,
 }
 
 fn finish_write<FE: GetSize>(
@@ -79,13 +77,23 @@ fn finish_write<FE: GetSize>(
 
 impl<FE: GetSize, F> Drop for FileWriteGuard<'_, FE, F> {
     fn drop(&mut self) {
-        finish_write(&mut self.guard, &mut self.state, &self.cache, self.previous);
+        finish_write(
+            &mut self.guard,
+            &mut self.state,
+            self.cache.0,
+            self.previous,
+        );
     }
 }
 
 impl<FE: GetSize, F> Drop for FileWriteGuardOwned<FE, F> {
     fn drop(&mut self) {
-        finish_write(&mut self.guard, &mut self.state, &self.cache, self.previous);
+        finish_write(
+            &mut self.guard,
+            &mut self.state,
+            &self.cache.0,
+            self.previous,
+        );
     }
 }
 
@@ -253,7 +261,7 @@ enum FileLockState {
     Pending,
     Read(usize),
     Modified(usize),
-    Deleted(bool),
+    Deleted,
     Failed,
 }
 
@@ -261,13 +269,9 @@ impl FileLockState {
     fn check_available(&self) -> Result<()> {
         match self {
             Self::Failed => Err(interrupted()),
-            Self::Deleted(_) => Err(deleted()),
+            Self::Deleted => Err(deleted()),
             _ => Ok(()),
         }
-    }
-
-    fn is_deleted(&self) -> bool {
-        matches!(self, Self::Deleted(_))
     }
 
     fn is_pending(&self) -> bool {
@@ -291,13 +295,66 @@ pub(crate) struct CachedFile<FE> {
 }
 
 impl<FE> CachedFile<FE> {
-    pub(crate) fn with_cache(&self, cache: Arc<Cache<FE>>) -> FileLock<FE> {
-        FileLock {
-            cache,
-            path: self.path.clone(),
-            state: self.state.clone(),
-            contents: self.contents.clone(),
-        }
+    pub(crate) fn evict(
+        &self,
+        cache: &Arc<Cache<FE>>,
+    ) -> Option<(usize, impl Future<Output = Result<()>> + Send)>
+    where
+        FE: FileSave + 'static,
+    {
+        // if this file is in use, don't evict it
+        let state = self.state.clone().try_write_owned().ok()?;
+
+        let (old_size, contents, modified) = match &*state {
+            FileLockState::Pending => {
+                // in this case there's nothing to evict
+                return None;
+            }
+            FileLockState::Read(size) => {
+                let contents = self.contents.clone().try_write_owned().ok()?;
+                (*size, contents, false)
+            }
+            FileLockState::Modified(size) => {
+                let contents = self.contents.clone().try_write_owned().ok()?;
+                (*size, contents, true)
+            }
+            FileLockState::Failed => return None,
+            FileLockState::Deleted => unreachable!("evict a deleted file"),
+        };
+
+        // Only writeback needs I/O admission; clean eviction just releases memory.
+        let permit = if modified {
+            Some(cache.try_acquire_file_handle().ok()?)
+        } else {
+            None
+        };
+
+        let cache = Arc::clone(cache);
+        let path = self.path.clone();
+        let eviction = async move {
+            let _release = cache.on_release();
+            let _permit = permit;
+            let mut state = state;
+            let mut contents = contents;
+            if modified {
+                let contents = contents.as_ref().expect("file");
+                cache.ensure_disk_space(&path)?;
+                persist_with(path, contents, false).await?;
+            }
+
+            *contents = None;
+            *state = FileLockState::Pending;
+            // Pending readers require exclusive contents access. Release it before
+            // publishing Pending by unlocking state, including to other workers.
+            drop(contents);
+            drop(state);
+
+            // Shrinking accounting cannot suspend. Release native guards first.
+            cache.release(old_size);
+            Ok(())
+        };
+
+        Some((old_size, eviction))
     }
 }
 
@@ -325,19 +382,28 @@ impl<FE> FileLock<FE> {
         Self {
             cache,
             path: Arc::new(path),
-            state: Arc::new(RwLock::new(FileLockState::Deleted(true))),
+            state: Arc::new(RwLock::new(FileLockState::Deleted)),
             contents: Arc::new(RwLock::new(None)),
         }
     }
 
-    async fn load_reserved(&self) -> Result<(usize, FE, crate::cache::Reservation<FE>)>
+    async fn load_reserved(
+        cache: &Arc<Cache<FE>>,
+        path: &Path,
+    ) -> Result<(usize, FE, crate::cache::Reservation<FE>)>
     where
         FE: FileLoad,
     {
-        let (file, metadata) = open(&self.path).await?;
-        let entry = FE::load(&self.path, file, metadata).await?;
+        let permit = cache.acquire_file_handle().await?;
+        let (file, metadata) = open(path).await?;
+        // This decoder reads an existing stored entry, not an application body.
+        let entry = FE::load(path, file, metadata)
+            .await
+            .map_err(crate::IntegrityError::from_read)?;
         let actual = entry.get_size();
-        let reservation = self.cache.reserve(actual).await?;
+        drop(permit);
+
+        let reservation = cache.reserve(actual).await?;
         Ok((actual, entry, reservation))
     }
 
@@ -380,7 +446,8 @@ impl<FE> FileLock<FE> {
         if Arc::ptr_eq(&self.state, &other.state) {
             return Ok(());
         }
-        let _permit = self.cache.acquire_file_handle().await?;
+
+        let _release = Release(&*self.cache);
         // Reciprocal copies acquire the same first state lock. The Arc keeps
         // its identity stable for the entire acquisition and copy.
         let (mut this, that) = if Arc::as_ptr(&self.state) < Arc::as_ptr(&other.state) {
@@ -398,9 +465,12 @@ impl<FE> FileLock<FE> {
             FileLockState::Read(size) | FileLockState::Modified(size) => size,
             _ => 0,
         };
+
         let mut contents = self.contents.write().await;
+        let permit = self.cache.acquire_file_handle().await?;
         match *that {
             FileLockState::Pending => {
+                self.cache.ensure_disk_space(&self.path)?;
                 create_dir(self.path.parent().expect("file parent dir")).await?;
                 fs::copy(other.path.as_path(), self.path.as_path()).await?;
                 *contents = None;
@@ -412,6 +482,7 @@ impl<FE> FileLock<FE> {
                 let source = other.contents.read().await;
                 let value = source.as_ref().expect("file").clone();
                 let actual = value.get_size();
+                drop(permit);
                 let reservation = self.cache.reserve(actual).await?;
                 *contents = Some(value);
                 *this = FileLockState::Modified(actual);
@@ -420,6 +491,7 @@ impl<FE> FileLock<FE> {
             }
             _ => unreachable!("validated source state"),
         }
+
         Ok(())
     }
 
@@ -429,7 +501,9 @@ impl<FE> FileLock<FE> {
         F: Send + Sync + 'static,
         FE: FileLoad + AsType<F> + From<F>,
     {
-        let permit = self.cache.acquire_file_handle().await?;
+        // Preserve pull-driven cooperation before acquiring exclusive state.
+        tokio::task::consume_budget().await;
+        let release = self.cache.on_release();
         // A ready cached read must not yield with exclusive state access.
         // Async lock acquisition may consume its cooperative budget after locking.
         let mut state = match self.state.try_write() {
@@ -441,16 +515,16 @@ impl<FE> FileLock<FE> {
 
         let guard = if state.is_pending() {
             let mut contents = self.contents.try_write().expect("file contents");
-            let (size, entry, reservation) = self.load_reserved().await?;
+            let (size, entry, reservation) = Self::load_reserved(&self.cache, &self.path).await?;
             reservation.commit();
-            self.cache.bump(&self.path, None);
+            self.cache.bump(&self.path);
 
             *state = FileLockState::Read(size);
             *contents = Some(entry);
 
             contents.downgrade()
         } else {
-            self.cache.bump(&self.path, None);
+            self.cache.bump(&self.path);
             // Do not cooperatively suspend a cached read while retaining the
             // exclusive state guard: another consumer may drive the next read
             // before polling this buffered future again.
@@ -460,9 +534,10 @@ impl<FE> FileLock<FE> {
             }
         };
 
-        read_type(guard).map(|guard| FileReadGuard {
+        let guard = read_type(guard)?;
+        Ok(FileReadGuard {
             guard,
-            _permit: permit,
+            _release: release,
         })
     }
 
@@ -472,19 +547,20 @@ impl<FE> FileLock<FE> {
         F: Send + Sync + 'static,
         FE: FileLoad + AsType<F>,
     {
-        let permit = self.cache.try_acquire_file_handle()?;
+        let release = self.cache.on_release();
         let state = self.state.try_read().map_err(would_block)?;
 
         match &*state {
             FileLockState::Pending => Err(would_block("this file is not in the cache")),
-            FileLockState::Deleted(_sync) => Err(deleted()),
+            FileLockState::Deleted => Err(deleted()),
             FileLockState::Failed => Err(interrupted()),
             FileLockState::Read(_size) | FileLockState::Modified(_size) => {
-                self.cache.bump(&self.path, None);
+                self.cache.bump(&self.path);
                 let guard = self.contents.try_read().map_err(would_block)?;
-                read_type(guard).map(|guard| FileReadGuard {
+                let guard = read_type(guard)?;
+                Ok(FileReadGuard {
                     guard,
-                    _permit: permit,
+                    _release: release,
                 })
             }
         }
@@ -496,7 +572,8 @@ impl<FE> FileLock<FE> {
         F: Send + Sync + 'static,
         FE: FileLoad + AsType<F> + From<F>,
     {
-        let permit = self.cache.acquire_file_handle().await?;
+        tokio::task::consume_budget().await;
+        let cache = Release(Arc::clone(&self.cache));
         // A ready cached read must not yield with exclusive state access.
         // Async lock acquisition may consume its cooperative budget after locking.
         let mut state = match self.state.try_write() {
@@ -513,26 +590,26 @@ impl<FE> FileLock<FE> {
                 .try_write_owned()
                 .expect("file contents");
 
-            let (size, entry, reservation) = self.load_reserved().await?;
+            let (size, entry, reservation) = Self::load_reserved(&cache.0, &self.path).await?;
             reservation.commit();
-            self.cache.bump(&self.path, None);
+            cache.0.bump(&self.path);
 
             *state = FileLockState::Read(size);
             *contents = Some(entry);
 
             contents.downgrade()
         } else {
-            self.cache.bump(&self.path, None);
+            cache.0.bump(&self.path);
             match self.contents.clone().try_read_owned() {
                 Ok(contents) => contents,
                 Err(_) => self.contents.clone().read_owned().await,
             }
         };
 
-        read_type_owned(guard).map(|guard| FileReadGuardOwned {
+        let guard = read_type_owned(guard)?;
+        Ok(FileReadGuardOwned {
             guard,
-            _cache: Arc::clone(&self.cache),
-            _permit: permit,
+            _cache: cache,
         })
     }
 
@@ -542,25 +619,25 @@ impl<FE> FileLock<FE> {
         F: Send + Sync + 'static,
         FE: FileLoad + AsType<F>,
     {
-        let permit = self.cache.try_acquire_file_handle()?;
+        let cache = Release(Arc::clone(&self.cache));
         let state = self.state.try_read().map_err(would_block)?;
 
         match &*state {
             FileLockState::Pending => Err(would_block("this file is not in the cache")),
-            FileLockState::Deleted(_sync) => Err(deleted()),
+            FileLockState::Deleted => Err(deleted()),
             FileLockState::Failed => Err(interrupted()),
             FileLockState::Read(_size) | FileLockState::Modified(_size) => {
-                self.cache.bump(&self.path, None);
+                cache.0.bump(&self.path);
                 let guard = self
                     .contents
                     .clone()
                     .try_read_owned()
                     .map_err(would_block)?;
 
-                read_type_owned(guard).map(|guard| FileReadGuardOwned {
+                let guard = read_type_owned(guard)?;
+                Ok(FileReadGuardOwned {
                     guard,
-                    _cache: Arc::clone(&self.cache),
-                    _permit: permit,
+                    _cache: cache,
                 })
             }
         }
@@ -572,7 +649,8 @@ impl<FE> FileLock<FE> {
         F: Send + Sync + 'static,
         FE: FileLoad + AsType<F> + From<F>,
     {
-        let permit = self.cache.acquire_file_handle().await?;
+        tokio::task::consume_budget().await;
+        let cache = Release(self.cache);
         // A ready cached read must not yield with exclusive state access.
         // Async lock acquisition may consume its cooperative budget after locking.
         let mut state = match self.state.try_write() {
@@ -583,31 +661,27 @@ impl<FE> FileLock<FE> {
         state.check_available()?;
 
         let guard = if state.is_pending() {
-            let mut contents = self
-                .contents
-                .clone()
-                .try_write_owned()
-                .expect("file contents");
-            let (size, entry, reservation) = self.load_reserved().await?;
+            let mut contents = self.contents.try_write_owned().expect("file contents");
+            let (size, entry, reservation) = Self::load_reserved(&cache.0, &self.path).await?;
             reservation.commit();
-            self.cache.bump(&self.path, None);
+            cache.0.bump(&self.path);
 
             *state = FileLockState::Read(size);
             *contents = Some(entry);
 
             contents.downgrade()
         } else {
-            self.cache.bump(&self.path, None);
+            cache.0.bump(&self.path);
             match self.contents.clone().try_read_owned() {
                 Ok(contents) => contents,
                 Err(_) => self.contents.read_owned().await,
             }
         };
 
-        read_type_owned(guard).map(|guard| FileReadGuardOwned {
+        let guard = read_type_owned(guard)?;
+        Ok(FileReadGuardOwned {
             guard,
-            _cache: Arc::clone(&self.cache),
-            _permit: permit,
+            _cache: cache,
         })
     }
 
@@ -617,51 +691,49 @@ impl<FE> FileLock<FE> {
         F: Send + Sync + 'static,
         FE: FileLoad + AsType<F> + From<F>,
     {
-        let permit = self.cache.acquire_file_handle().await?;
+        let release = Release(&*self.cache);
         let mut state = self.state.write().await;
         state.check_available()?;
         let mut guard = self.contents.write().await;
         if state.is_pending() {
-            let (size, entry, reservation) = self.load_reserved().await?;
+            let (size, entry, reservation) = Self::load_reserved(&self.cache, &self.path).await?;
             *guard = Some(entry);
             *state = FileLockState::Read(size);
             reservation.commit();
         }
 
         let current = check_write::<FE, F>(&guard, &state)?;
-        self.cache.bump(&self.path, None);
+        self.cache.bump(&self.path);
 
         Ok(FileWriteGuard {
             guard,
             state,
-            cache: Arc::clone(&self.cache),
+            cache: release,
             previous: current,
             _payload: PhantomData,
-            _permit: permit,
         })
     }
 
-    /// Admit and lock a cached file immediately, or return an admission/lock error.
+    /// Lock a cached file immediately, or return a lock or availability error.
     pub fn try_write<F>(&self) -> Result<FileWriteGuard<'_, FE, F>>
     where
         F: Send + Sync + 'static,
         FE: FileLoad + AsType<F>,
     {
-        let permit = self.cache.try_acquire_file_handle()?;
+        let release = Release(&*self.cache);
         let state = self.state.try_write().map_err(would_block)?;
         state.check_available()?;
         let guard = self.contents.try_write().map_err(would_block)?;
 
         let current = check_write::<FE, F>(&guard, &state)?;
-        self.cache.bump(&self.path, None);
+        self.cache.bump(&self.path);
 
         Ok(FileWriteGuard {
             guard,
             state,
-            cache: Arc::clone(&self.cache),
+            cache: release,
             previous: current,
             _payload: PhantomData,
-            _permit: permit,
         })
     }
 
@@ -671,64 +743,94 @@ impl<FE> FileLock<FE> {
         F: Send + Sync + 'static,
         FE: FileLoad + AsType<F> + From<F>,
     {
-        let permit = self.cache.acquire_file_handle().await?;
-        let mut state = Arc::clone(&self.state).write_owned().await;
+        Self::write_owned_inner(
+            self.cache.clone(),
+            &self.path,
+            self.state.clone(),
+            self.contents.clone(),
+        )
+        .await
+    }
+
+    async fn write_owned_inner<F>(
+        cache: Arc<Cache<FE>>,
+        path: &PathBuf,
+        state: Arc<RwLock<FileLockState>>,
+        contents: Arc<RwLock<Option<FE>>>,
+    ) -> Result<FileWriteGuardOwned<FE, F>>
+    where
+        F: Send + Sync + 'static,
+        FE: FileLoad + AsType<F> + From<F>,
+    {
+        let cache = Release(cache);
+        let mut state = state.write_owned().await;
         state.check_available()?;
-        let mut guard = Arc::clone(&self.contents).write_owned().await;
+        let mut guard = contents.write_owned().await;
         if state.is_pending() {
-            let (size, entry, reservation) = self.load_reserved().await?;
+            let (size, entry, reservation) = Self::load_reserved(&cache.0, path).await?;
             *guard = Some(entry);
             *state = FileLockState::Read(size);
             reservation.commit();
         }
 
         let current = check_write::<FE, F>(&guard, &state)?;
-        self.cache.bump(&self.path, None);
+        cache.0.bump(path);
 
         Ok(FileWriteGuardOwned {
             guard,
             state,
-            cache: Arc::clone(&self.cache),
+            cache,
             previous: current,
             _payload: PhantomData,
-            _permit: permit,
         })
     }
 
-    /// Admit and lock a cached file immediately, or return an admission/lock error.
+    /// Lock a cached file immediately, or return a lock or availability error.
     pub fn try_write_owned<F>(&self) -> Result<FileWriteGuardOwned<FE, F>>
     where
         FE: GetSize + AsType<F>,
     {
-        let permit = self.cache.try_acquire_file_handle()?;
-        let state = Arc::clone(&self.state)
-            .try_write_owned()
-            .map_err(would_block)?;
+        Self::try_write_owned_inner(
+            self.cache.clone(),
+            &self.path,
+            self.state.clone(),
+            self.contents.clone(),
+        )
+    }
+
+    fn try_write_owned_inner<F>(
+        cache: Arc<Cache<FE>>,
+        path: &PathBuf,
+        state: Arc<RwLock<FileLockState>>,
+        contents: Arc<RwLock<Option<FE>>>,
+    ) -> Result<FileWriteGuardOwned<FE, F>>
+    where
+        FE: GetSize + AsType<F>,
+    {
+        let cache = Release(cache);
+        let state = state.try_write_owned().map_err(would_block)?;
         state.check_available()?;
-        let guard = Arc::clone(&self.contents)
-            .try_write_owned()
-            .map_err(would_block)?;
+        let guard = contents.try_write_owned().map_err(would_block)?;
 
         let current = check_write::<FE, F>(&guard, &state)?;
-        self.cache.bump(&self.path, None);
+        cache.0.bump(path);
 
         Ok(FileWriteGuardOwned {
             guard,
             state,
-            cache: Arc::clone(&self.cache),
+            cache,
             previous: current,
             _payload: PhantomData,
-            _permit: permit,
         })
     }
 
-    /// Admit and lock this file for mutation without borrowing the file handle.
+    /// Lock this file for mutation without borrowing the file handle.
     pub async fn into_write<F>(self) -> Result<FileWriteGuardOwned<FE, F>>
     where
         F: Send + Sync + 'static,
         FE: FileLoad + AsType<F> + From<F>,
     {
-        self.write_owned().await
+        Self::write_owned_inner(self.cache, &self.path, self.state, self.contents).await
     }
 
     /// Admit and lock this file for mutation immediately without borrowing.
@@ -737,18 +839,27 @@ impl<FE> FileLock<FE> {
         F: Send + Sync + 'static,
         FE: FileLoad + AsType<F>,
     {
-        self.try_write_owned()
+        Self::try_write_owned_inner(self.cache, &self.path, self.state, self.contents)
     }
 
     /// Write buffered contents to the filesystem without a durability barrier.
+    /// Deleted handles return `NotFound`; their directory owns native removal.
     pub async fn sync(&self) -> Result<()>
     where
         FE: FileSave,
     {
+        let _release = self.cache.on_release();
         let mut state = self.state.write().await;
+        state.check_available()?;
+        let _permit = self.cache.acquire_file_handle().await?;
+        self.sync_locked(&mut state).await
+    }
 
+    async fn sync_locked(&self, state: &mut FileLockState) -> Result<()>
+    where
+        FE: FileSave,
+    {
         let new_state = match &*state {
-            FileLockState::Failed => return Err(interrupted()),
             FileLockState::Pending => FileLockState::Pending,
             FileLockState::Read(size) => FileLockState::Read(*size),
             FileLockState::Modified(old_size) => {
@@ -762,12 +873,8 @@ impl<FE> FileLock<FE> {
                 persist_with(self.path.clone(), contents, false).await?;
                 FileLockState::Read(*old_size)
             }
-            FileLockState::Deleted(pending_delete) => {
-                if *pending_delete {
-                    delete_file(&self.path).await?;
-                }
-
-                FileLockState::Deleted(false)
+            FileLockState::Deleted | FileLockState::Failed => {
+                unreachable!("sync requires available file state")
             }
         };
 
@@ -777,6 +884,7 @@ impl<FE> FileLock<FE> {
     }
 
     /// Make this file's contents and its directory entry durable, including prior eviction.
+    /// Deleted handles return `NotFound`; their directory owns native removal.
     pub async fn sync_all(&self) -> Result<()>
     where
         FE: FileSave,
@@ -788,29 +896,24 @@ impl<FE> FileLock<FE> {
     where
         FE: FileSave,
     {
+        let _release = self.cache.on_release();
+        let mut state = self.state.write().await;
+        state.check_available()?;
         let _permit = self.cache.acquire_file_handle().await?;
-        self.sync().await?;
-        let state = self.state.write().await;
-        if matches!(*state, FileLockState::Failed) {
-            return Err(interrupted());
-        }
-        // A writer can enter between writeback and this lock. Do not acknowledge its data.
-        if matches!(*state, FileLockState::Modified(_)) {
-            return Err(would_block("file modified during durable synchronization"));
-        }
-        if !state.is_deleted() {
-            fs::OpenOptions::new()
-                .write(true)
-                .open(self.path())
-                .await?
-                .sync_all()
-                .await?;
-        }
+        self.sync_locked(&mut state).await?;
+        // Retain exclusive state through writeback and the durability barriers.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(self.path())
+            .await?
+            .sync_all()
+            .await?;
         // A prior subtree barrier may have synchronized contents before failing
         // on its directory. Always complete publication for standalone calls.
         if parent {
             sync_directory(self.path.parent().expect("file parent")).await?;
         }
+
         Ok(())
     }
 
@@ -824,22 +927,27 @@ impl<FE> FileLock<FE> {
     {
         let actual = value.get_size();
         self.cache.validate_size(actual)?;
-        let _permit = self.cache.acquire_file_handle().await?;
+        let _release = self.cache.on_release();
         let mut state = self.state.write().await;
         state.check_available()?;
         let old_size = match *state {
             FileLockState::Read(size) | FileLockState::Modified(size) => size,
             _ => 0,
         };
+
         let mut contents = self.contents.write().await;
         let reservation = if actual > old_size {
             Some(self.cache.reserve(actual - old_size).await?)
         } else {
             None
         };
+
+        let _permit = self.cache.acquire_file_handle().await?;
         self.cache.ensure_disk_space(&self.path)?;
         *state = FileLockState::Failed;
-        persist_with(self.path.clone(), &value, true).await?;
+        persist_with(self.path.clone(), &value, true)
+            .await
+            .map_err(crate::IntegrityError::mark)?;
         *contents = Some(value);
         if let Some(reservation) = reservation {
             reservation.commit();
@@ -849,7 +957,24 @@ impl<FE> FileLock<FE> {
         Ok(())
     }
 
-    pub(crate) async fn delete(&self, file_only: bool) {
+    // Only the owning directory's retained tombstone may remove the native name.
+    pub(crate) async fn remove_from_disk(&self) -> Result<()>
+    where
+        FE: Send + Sync,
+    {
+        let _release = self.cache.on_release();
+        let state = self.state.write().await;
+        match *state {
+            FileLockState::Failed => return Err(interrupted()),
+            FileLockState::Deleted => {}
+            _ => unreachable!("native removal requires a directory tombstone"),
+        }
+
+        let _permit = self.cache.acquire_file_handle().await?;
+        delete_file(&self.path).await
+    }
+
+    pub(crate) async fn delete(&self) {
         let mut file_state = self.state.write().await;
 
         let size = match &*file_state {
@@ -857,58 +982,12 @@ impl<FE> FileLock<FE> {
             FileLockState::Pending => 0,
             FileLockState::Read(size) => *size,
             FileLockState::Modified(size) => *size,
-            FileLockState::Deleted(_) => return,
+            FileLockState::Deleted => return,
         };
 
         *self.contents.write().await = None;
         self.cache.remove(&self.path, size);
-        *file_state = FileLockState::Deleted(file_only);
-    }
-
-    pub(crate) fn evict(self) -> Option<(usize, impl Future<Output = Result<()>> + Send)>
-    where
-        FE: FileSave + 'static,
-    {
-        // if this file is in use, don't evict it
-        let mut state = self.state.try_write_owned().ok()?;
-
-        let (old_size, mut contents, modified) = match &*state {
-            FileLockState::Pending => {
-                // in this case there's nothing to evict
-                return None;
-            }
-            FileLockState::Read(size) => {
-                let contents = self.contents.try_write_owned().ok()?;
-                (*size, contents, false)
-            }
-            FileLockState::Modified(size) => {
-                let contents = self.contents.try_write_owned().ok()?;
-                (*size, contents, true)
-            }
-            FileLockState::Failed => return None,
-            FileLockState::Deleted(_) => unreachable!("evict a deleted file"),
-        };
-
-        let eviction = async move {
-            if modified {
-                let contents = contents.as_ref().expect("file");
-                self.cache.ensure_disk_space(&self.path)?;
-                persist_with(self.path.clone(), contents, false).await?;
-            }
-
-            *contents = None;
-            *state = FileLockState::Pending;
-            // Pending readers require exclusive contents access. Release it before
-            // publishing Pending by unlocking state, including to other workers.
-            drop(contents);
-            drop(state);
-
-            // Shrinking accounting cannot suspend. Release native guards first.
-            self.cache.release(old_size);
-            Ok(())
-        };
-
-        Some((old_size, eviction))
+        *file_state = FileLockState::Deleted;
     }
 }
 
@@ -957,20 +1036,9 @@ async fn persist_with<FE: FileSave>(path: Arc<PathBuf>, file: &FE, durable: bool
                 fs::File::create(tmp.as_path()).await
             }
             result => result,
-        }
-        .map_err(|cause| {
-            io::Error::new(
-                cause.kind(),
-                format!("failed to create tmp file: {}", cause),
-            )
-        })?;
+        }?;
 
-        let size = file
-            .save(&mut tmp_file)
-            .map_err(|cause| {
-                io::Error::new(cause.kind(), format!("failed to save tmp file: {}", cause))
-            })
-            .await?;
+        let size = file.save(&mut tmp_file).await?;
         // Complete Tokio's buffered writes before publishing the name. This is
         // writeback, not a durability barrier, and also propagates delayed errors.
         tmp_file.flush().await?;
@@ -980,42 +1048,19 @@ async fn persist_with<FE: FileSave>(path: Arc<PathBuf>, file: &FE, durable: bool
         size
     };
 
-    tokio::fs::rename(tmp.as_path(), path.as_path())
-        .map_err(|cause| {
-            io::Error::new(
-                cause.kind(),
-                format!("failed to rename tmp file: {}", cause),
-            )
-        })
-        .await?;
+    tokio::fs::rename(tmp.as_path(), path.as_path()).await?;
 
     if durable {
         sync_directory(path.parent().expect("file parent")).await?;
     }
+
     Ok(size)
 }
 
 async fn create_dir(path: &Path) -> Result<()> {
-    if path.exists() {
-        Ok(())
-    } else {
-        match tokio::fs::create_dir_all(path).await {
-            Ok(()) => Ok(()),
-            Err(cause) => {
-                if path.exists() && path.is_dir() {
-                    Ok(())
-                } else {
-                    Err(io::Error::new(
-                        cause.kind(),
-                        format!("failed to create directory: {}", cause),
-                    ))
-                }
-            }
-        }
-    }
+    tokio::fs::create_dir_all(path).await
 }
 
-#[inline]
 fn read_type<F, T>(maybe_file: RwLockReadGuard<Option<F>>) -> Result<RwLockReadGuard<T>>
 where
     F: AsType<T>,
@@ -1056,6 +1101,7 @@ fn check_write<FE: AsType<F>, F>(contents: &Option<FE>, state: &FileLockState) -
             std::any::type_name::<F>()
         )));
     }
+
     Ok(current)
 }
 

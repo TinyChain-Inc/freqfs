@@ -1,16 +1,17 @@
-//! `freqfs` is an in-memory cache layer over [`tokio::fs`] with least-frequently-used eviction.
+//! `freqfs` is an in-memory cache layer over [`tokio::fs`] with one-position promotion per cache hit.
 //!
-//! `freqfs` automatically caches the most frequently-used files and backs up the others to disk.
+//! Cache hits promote entries one position; eviction scans from the back and writes
+//! dirty values to disk. This is neither exact LFU nor LRU.
 //! This allows the developer to create and update large collections of data purely in-memory
 //! without explicitly sync'ing to disk, while still retaining the flexibility to run on a host
 //! with extremely limited memory. This is especially useful for web serving, database,
 //! and data science applications.
 //!
-//! See the [examples](https://github.com/haydnv/freqfs/tree/main/examples) directory for
+//! See the [examples](https://github.com/TinyChain-Inc/freqfs/tree/main/examples) directory for
 //! detailed usage examples.
 //!
-//! This crate assumes that file paths are valid Unicode and may panic if it encounters a file path
-//! which is not valid Unicode.
+//! Directory entry names must be valid Unicode; loading rejects unsupported names
+//! and filesystem entry types with an I/O error.
 //!
 //! It also assumes that all file I/O under the cache root directory
 //! (the one whose path is passed to `load`) is routed through the cache
@@ -26,13 +27,16 @@
 mod cache;
 mod dir;
 mod file;
+mod integrity;
+
+pub use integrity::IntegrityError;
 
 type Result<T> = std::result::Result<T, std::io::Error>;
 
 pub use cache::Cache;
 pub use dir::{
     Dir, DirDeref, DirEntry, DirLock, DirReadGuard, DirReadGuardOwned, DirWriteGuard,
-    DirWriteGuardOwned, Name,
+    DirWriteGuardOwned,
 };
 pub use file::{
     FileDeref, FileLoad, FileLock, FileReadGuard, FileReadGuardOwned, FileSave, FileWriteGuard,

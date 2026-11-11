@@ -1,34 +1,44 @@
 use std::io;
+use std::ops::Deref;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use futures::future::Future;
 use futures::stream::{FuturesUnordered, StreamExt};
-use tokio::sync::mpsc::{self, error::TrySendError, Receiver, Sender};
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio::time::Duration;
 
+use self::priority::PriorityMap;
 use super::dir::DirLock;
 use super::file::{CachedFile, FileLock, FileSave};
 use super::Result;
 
+mod priority;
+
+// Default to 512 concurrent file operations per cache to give bulk reads and
+// writeback room to overlap. Callers can lower the limit on smaller hosts.
 const MAX_FILE_HANDLES: usize = 512;
 
-type Lfu<FE> = ds_ext::LinkedHashMap<PathBuf, CachedFile<FE>>;
-
 struct State<FE> {
-    files: Lfu<FE>,
+    files: PriorityMap<CachedFile<FE>>,
     size: usize,
     roots: Vec<PathBuf>,
+    gc_pending: bool,
+    requested: usize,
+    eviction_error: Option<io::Error>,
 }
 
 impl<FE> State<FE> {
     fn new() -> Self {
         Self {
             size: 0,
-            files: Lfu::new(),
+            files: PriorityMap::new(),
             roots: Vec::new(),
+            gc_pending: false,
+            requested: 0,
+            eviction_error: None,
         }
     }
 }
@@ -36,11 +46,8 @@ impl<FE> State<FE> {
 #[derive(Debug)]
 struct Evict;
 
-/// An in-memory cache layer over [`tokio::fs`] with least-frequently-used (LFU) eviction.
+/// An in-memory cache layer over [`tokio::fs`] with one-position promotion per hit and eviction from the back.
 pub struct Cache<FE> {
-    gc_pending: AtomicBool,
-    eviction_error: Mutex<Option<io::Error>>,
-    requested: AtomicUsize,
     capacity: usize,
     max_file_handles: usize,
     minimum_free_disk_bytes: u64,
@@ -52,27 +59,52 @@ pub struct Cache<FE> {
 }
 
 impl<FE> Cache<FE> {
-    #[inline]
-    fn check(&self, state: MutexGuard<State<FE>>) {
-        if (state.size > self.capacity || self.requested.load(Ordering::Acquire) > 0)
-            && self
-                .gc_pending
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-        {
-            match self.tx.try_send(Evict) {
-                Ok(()) => {}
-                Err(TrySendError::Full(_)) => {}
-                Err(TrySendError::Closed(_)) => {
-                    self.gc_pending.store(false, Ordering::Release);
-                    *self.eviction_error.lock().expect("eviction error") = Some(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "cache cleanup task stopped",
-                    ));
-                    self.capacity_released.notify_waiters();
-                }
+    /// The configured concurrency limit for file operations and lifecycle work.
+    pub(crate) fn max_file_handles(&self) -> usize {
+        self.max_file_handles
+    }
+
+    fn request_cleanup(&self, state: &mut State<FE>) {
+        state.gc_pending = true;
+        match self.tx.try_send(Evict) {
+            Ok(()) | Err(TrySendError::Full(_)) => {}
+            Err(TrySendError::Closed(_)) => {
+                state.gc_pending = false;
+                state.eviction_error = Some(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "cache cleanup task stopped",
+                ));
+                self.capacity_released.notify_waiters();
             }
         }
+    }
+
+    #[inline]
+    fn check(&self, mut state: MutexGuard<State<FE>>) {
+        if !state.gc_pending
+            && state.eviction_error.is_none()
+            && (state.size > self.capacity || state.requested > 0)
+        {
+            self.request_cleanup(&mut state);
+        }
+    }
+
+    fn released(&self) {
+        let mut state = self.lock();
+        // A release can race an active pass's scan. The bounded channel retains
+        // one rescan, rather than waking admission after a no-progress pass.
+        if state.eviction_error.is_none() && (state.size > self.capacity || state.requested > 0) {
+            self.request_cleanup(&mut state);
+        }
+        drop(state);
+        self.capacity_released.notify_waiters();
+    }
+
+    pub(crate) fn on_release(&self) -> BorrowedRelease<'_>
+    where
+        FE: Send + Sync,
+    {
+        Release(self)
     }
 
     #[inline]
@@ -80,16 +112,10 @@ impl<FE> Cache<FE> {
         self.state.lock().expect("file cache state")
     }
 
-    pub(crate) fn bump(&self, path: &PathBuf, file_size: Option<usize>) -> bool {
+    pub(crate) fn bump(&self, path: &PathBuf) {
         let mut state = self.lock();
-
-        if let Some(file_size) = file_size {
-            state.size += file_size;
-        }
-
-        let exists = state.files.bump(path);
+        state.files.bump(path);
         self.check(state);
-        exists
     }
 
     pub(crate) fn validate_size(&self, bytes: usize) -> Result<()> {
@@ -105,6 +131,7 @@ impl<FE> Cache<FE> {
 
     pub(crate) async fn reserve(self: &Arc<Self>, bytes: usize) -> Result<Reservation<FE>> {
         let deadline = tokio::time::Instant::now() + self.handle_wait;
+
         loop {
             // Register before attempting admission so a release cannot be missed.
             let notified = self.capacity_released.notified();
@@ -123,17 +150,18 @@ impl<FE> Cache<FE> {
     // None means capacity pressure; eviction errors retain their original kind.
     fn reserve_if_available(self: &Arc<Self>, bytes: usize) -> Result<Option<Reservation<FE>>> {
         self.validate_size(bytes)?;
-        if let Some(cause) = self.eviction_error.lock().expect("eviction error").take() {
+
+        let mut state = self.lock();
+        if let Some(cause) = state.eviction_error.take() {
             return Err(cause);
         }
 
-        let mut state = self.lock();
         if state
             .size
             .checked_add(bytes)
             .is_none_or(|size| size > self.capacity)
         {
-            self.requested.fetch_max(bytes, Ordering::AcqRel);
+            state.requested = state.requested.max(bytes);
             self.check(state);
             return Ok(None);
         }
@@ -155,10 +183,7 @@ impl<FE> Cache<FE> {
 
         let mut state = self.lock();
         state.size = state.size - previous + actual;
-        self.check(state);
-        if actual < previous {
-            self.capacity_released.notify_waiters();
-        }
+        // The writer's release field signals after its native guards drop.
     }
 
     pub(crate) fn release(&self, bytes: usize) {
@@ -199,6 +224,13 @@ impl<FE> Cache<FE> {
     }
 
     pub(crate) async fn acquire_file_handle(&self) -> Result<OwnedSemaphorePermit> {
+        // Ready cached reads must not cooperatively yield with exclusive state.
+        match self.try_acquire_file_handle() {
+            Ok(permit) => return Ok(permit),
+            Err(error) if error.kind() == io::ErrorKind::ResourceBusy => {}
+            Err(error) => return Err(error),
+        }
+
         tokio::time::timeout(
             self.handle_wait,
             Arc::clone(&self.file_handles).acquire_owned(),
@@ -230,6 +262,7 @@ impl<FE> Cache<FE> {
                 io::Error::new(io::ErrorKind::NotFound, "no filesystem root for cache path")
             })?;
         }
+
         let available = fs2::available_space(root)?;
         if available < self.minimum_free_disk_bytes {
             return Err(io::Error::new(
@@ -240,6 +273,7 @@ impl<FE> Cache<FE> {
                 ),
             ));
         }
+
         Ok(())
     }
 }
@@ -250,13 +284,17 @@ where
 {
     /// Initialize the cache.
     ///
-    /// `max_file_handles` specifies how many files are allowed to be evicted at once.
+    /// `max_file_handles` bounds active file operations, including dirty eviction,
+    /// using one shared semaphore. Cached guards pin memory without I/O admission.
     /// If not specified, `max_file_handles` will default to 512.
     ///
     /// `minimum_free_disk_bytes` checks current filesystem free space before a
     /// write. It is not an encoded-size estimate or a reservation for that write.
     ///
-    /// Panics: if `max_file_handles` is `Some(0)`
+    /// Native construction requires an active Tokio runtime and a positive
+    /// `max_file_handles` no larger than `tokio::sync::Semaphore::MAX_PERMITS`.
+    /// Invalid native configuration panics; hosts accepting configuration from
+    /// untrusted callers must validate it before construction.
     pub fn new(
         capacity: usize,
         max_file_handles: Option<usize>,
@@ -274,9 +312,6 @@ where
         // Eviction requests are coalesced by the single in-flight GC permit.
         let (tx, rx) = mpsc::channel(1);
         let cache = Arc::new(Self {
-            gc_pending: AtomicBool::new(false),
-            eviction_error: Mutex::new(None),
-            requested: AtomicUsize::new(0),
             capacity,
             max_file_handles,
             minimum_free_disk_bytes,
@@ -298,7 +333,7 @@ where
     /// a [`DirLock`] or [`FileLock`].
     pub fn load(self: Arc<Self>, path: PathBuf) -> Result<DirLock<FE>> {
         {
-            let state = self.lock();
+            let mut state = self.lock();
 
             for root in &state.roots {
                 if root.starts_with(&path) || path.starts_with(root) {
@@ -311,14 +346,22 @@ where
                     ));
                 }
             }
+
+            // The same claim excludes overlap during loading and after publication.
+            state.roots.push(path.clone());
         }
 
-        let dir = DirLock::load(self.clone(), path.clone())?;
+        #[cfg(test)]
+        tests::root_claimed();
 
-        let mut state = self.lock();
-        state.roots.push(path);
-
-        Ok(dir)
+        match DirLock::load(self.clone(), path.clone()) {
+            Ok(dir) => Ok(dir),
+            Err(cause) => {
+                // Loading discards unpublished file registrations before returning.
+                self.lock().roots.retain(|root| root != &path);
+                Err(cause)
+            }
+        }
     }
 
     fn gc_for(
@@ -336,17 +379,52 @@ where
         let mut over = state.size.saturating_add(requested) - self.capacity;
 
         for (_path, file) in state.files.iter().rev() {
-            if let Some((size, eviction)) = file.with_cache(Arc::clone(self)).evict() {
+            // Bound prepared work independently of I/O admission: clean entries
+            // remain reclaimable even while every I/O permit is occupied.
+            if evictions.len() >= self.max_file_handles() {
+                break;
+            }
+
+            if let Some((size, eviction)) = file.evict(self) {
                 over = over.saturating_sub(size);
                 evictions.push(eviction);
             }
 
-            if over == 0 || evictions.len() >= self.max_file_handles {
+            if over == 0 {
                 break;
             }
         }
 
         evictions
+    }
+}
+
+// Only borrowed read guards erase the entry type, preserving their public
+// signature. Both borrowed and owned release fields drop after native guards;
+// notification itself allocates nothing and acquires no resource.
+pub(crate) trait Released {
+    fn released(&self);
+}
+
+impl<FE> Released for Cache<FE> {
+    fn released(&self) {
+        Cache::released(self);
+    }
+}
+
+pub(crate) struct Release<C: Deref>(pub(crate) C)
+where
+    C::Target: Released;
+
+pub(crate) type BorrowedRelease<'a> = Release<&'a (dyn Released + Sync)>;
+pub(crate) type OwnedRelease<FE> = Release<Arc<Cache<FE>>>;
+
+impl<C: Deref> Drop for Release<C>
+where
+    C::Target: Released,
+{
+    fn drop(&mut self) {
+        self.0.released();
     }
 }
 
@@ -377,39 +455,59 @@ fn spawn_cleanup_thread<FE>(
 where
     FE: FileSave,
 {
+    #[cfg(test)]
+    let observation = tests::cleanup_observer();
+
     tokio::spawn(async move {
         while let Some(Evict) = rx.recv().await {
             let Some(cache) = cache.upgrade() else {
                 break;
             };
-            let requested = cache.requested.swap(0, Ordering::AcqRel);
+            let requested = {
+                let mut state = cache.lock();
+                if state.eviction_error.is_some() {
+                    state.gc_pending = false;
+                    continue;
+                }
+                state.gc_pending = true;
+                std::mem::take(&mut state.requested)
+            };
+
             let mut evictions = cache.gc_for(requested);
-            let mut evicted = false;
+            let mut reclaimed = false;
+            let mut failure = None;
 
             while let Some(result) = evictions.next().await {
-                evicted = true;
                 match result {
-                    Ok(()) => {}
+                    Ok(()) => reclaimed = true,
                     Err(cause) => {
                         #[cfg(feature = "logging")]
                         log::error!("failed to evict cached file: {cause}");
-                        let mut error = cache.eviction_error.lock().expect("eviction error");
-                        if error.is_none() {
-                            *error = Some(cause);
+                        if failure.is_none() {
+                            failure = Some(cause);
                         }
                     }
                 }
             }
 
-            cache.gc_pending.store(false, Ordering::Release);
-            cache.capacity_released.notify_waiters();
-            if evicted {
-                cache.check(cache.lock());
+            let mut state = cache.lock();
+            state.gc_pending = false;
+            if let Some(cause) = failure {
+                state.eviction_error = Some(cause);
+                drop(state);
+                cache.capacity_released.notify_waiters();
+            } else if reclaimed || state.requested > 0 {
+                cache.check(state);
+            } else {
+                drop(state);
             }
+
+            #[cfg(test)]
+            tests::cleanup_pass_finished(observation.as_deref());
         }
     })
 }
 
 #[cfg(test)]
 #[path = "../tests/unit/cache.rs"]
-mod tests;
+pub(crate) mod tests;
