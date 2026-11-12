@@ -35,8 +35,8 @@ type Result<T> = std::result::Result<T, std::io::Error>;
 
 pub use cache::Cache;
 pub use dir::{
-    Dir, DirDeref, DirEntry, DirLock, DirReadGuard, DirReadGuardOwned, DirWriteGuard,
-    DirWriteGuardOwned,
+    validate_name, Dir, DirDeref, DirEntry, DirLock, DirReadGuard, DirReadGuardOwned,
+    DirWriteGuard, DirWriteGuardOwned,
 };
 pub use file::{
     FileDeref, FileLoad, FileLock, FileReadGuard, FileReadGuardOwned, FileSave, FileWriteGuard,

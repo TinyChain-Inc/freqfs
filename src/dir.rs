@@ -145,7 +145,8 @@ impl<FE> DirEntry<FE> {
 }
 
 // Names are native directory entries, never relative or absolute paths.
-fn validate_name(name: &str) -> Result<()> {
+/// Validate one native filename, including the reserved writeback-name rules.
+pub fn validate_name(name: &str) -> Result<()> {
     let mut components = Path::new(name).components();
     if name.contains('\0')
         || !matches!(components.next(),
