@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::ops::Deref;
+use std::ops::{Deref, RangeBounds};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{fmt, io, mem};
@@ -200,6 +200,13 @@ impl<FE: Send + Sync> Dir<FE> {
         self.cache.max_file_handles()
     }
 
+    /// Maximum retained size admitted for one file, including its native value
+    /// and container capacity. This is not an encoded-byte or free-space bound,
+    /// and does not reserve residency against competing cache users.
+    pub fn max_file_size(&self) -> usize {
+        self.cache.max_file_size()
+    }
+
     /// Return `true` if this [`Dir`] has an entry with the given `name`.
     pub fn contains(&self, name: &str) -> bool {
         self.get(name).is_some()
@@ -318,6 +325,21 @@ impl<FE: Send + Sync> Dir<FE> {
     /// Return an [`Iterator`] over the names of the entries in this [`Dir`].
     pub fn names(&self) -> impl Iterator<Item = &String> {
         self.contents.keys()
+    }
+
+    /// Iterate over entries within lexical name bounds, borrowing this directory.
+    /// Bounds may name absent entries. Release the iterator and directory guard
+    /// before mutation; a new range can resume after the last visited name.
+    ///
+    /// # Panics
+    ///
+    /// Like [`BTreeMap::range`], panics if the start exceeds the end or if both
+    /// bounds exclude the same name. Callers must supply valid bounds.
+    pub fn range<R>(&self, bounds: R) -> impl Iterator<Item = (&String, &DirEntry<FE>)>
+    where
+        R: RangeBounds<str>,
+    {
+        self.contents.range::<str, _>(bounds)
     }
 
     /// Convenience method to lock a file for reading.

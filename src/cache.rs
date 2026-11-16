@@ -118,6 +118,10 @@ impl<FE> Cache<FE> {
         self.check(state);
     }
 
+    pub(crate) fn max_file_size(&self) -> usize {
+        self.capacity
+    }
+
     pub(crate) fn validate_size(&self, bytes: usize) -> Result<()> {
         if bytes > self.capacity {
             Err(io::Error::new(
