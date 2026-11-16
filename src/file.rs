@@ -397,7 +397,10 @@ impl<FE> FileLock<FE> {
         let permit = cache.acquire_file_handle().await?;
         let (file, metadata) = open(path).await?;
         // This decoder reads an existing stored entry, not an application body.
-        let entry = FE::load(path, file, metadata)
+        // Composed decoders otherwise inflate even cached-read futures, causing
+        // stack overflow when stream combinators move their completed state.
+        // Allocate decoder state only on a cache miss, at this file boundary.
+        let entry = Box::pin(FE::load(path, file, metadata))
             .await
             .map_err(crate::IntegrityError::from_read)?;
         let actual = entry.get_size();

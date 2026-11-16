@@ -1,4 +1,5 @@
 use std::io;
+use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -62,6 +63,51 @@ impl Drop for TestDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+#[tokio::test]
+async fn name_ranges_resume_after_deleting_the_previous_child() -> io::Result<()> {
+    let fixture = TestDir::new()?;
+    let cache = Cache::<Entry>::new(1024, None, 0, Duration::from_secs(3));
+    let root = cache.load(fixture.0.clone())?;
+    {
+        let mut dir = root.write().await;
+        assert!(dir.range(..).next().is_none());
+        for name in ["c", "a", "b"] {
+            dir.create_dir(name.into())?;
+        }
+
+        assert_eq!(
+            dir.range(..).next().map(|(name, _)| name.as_str()),
+            Some("a")
+        );
+
+        assert_eq!(
+            dir.range((Included("a"), Excluded("c")))
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+
+        assert_eq!(
+            dir.range((Excluded("a"), Unbounded))
+                .next()
+                .map(|(name, _)| name.as_str()),
+            Some("b")
+        );
+
+        dir.delete("a").await;
+        assert_eq!(
+            dir.range((Excluded("a"), Unbounded))
+                .next()
+                .map(|(name, _)| name.as_str()),
+            Some("b")
+        );
+
+        assert!(dir.range((Excluded("c"), Unbounded)).next().is_none());
+    }
+
+    Ok(())
 }
 
 #[tokio::test]

@@ -69,6 +69,12 @@ and UUID spelling is not normalized. Borrow existing strings or IDs directly;
 format typed identifiers into caller-owned stack buffers before lookup. Only
 insertion needs an owned name. Existing filenames are unchanged.
 
+`Dir::range(bounds)` iterates over borrowed `(name, entry)` pairs in lexical
+order, using standard range bounds such as `(Excluded(last_name), Unbounded)`.
+It seeks directly into the directory index without copying it. The iterator
+borrows the directory guard; release both before mutation, then resume with a
+new range after the last visited name. That name need not still exist.
+
 Creation and copying accept one native filename component, never a path. Empty
 names, `.`, `..`, absolute paths, separators, and NUL bytes reject with
 `InvalidInput` before publication or mutation. File replacement temporary names
